@@ -4,15 +4,19 @@
 //!     docker compose up -d
 //!     NOMAD_TEST_URL=http://localhost:8123 cargo test --test integration
 
-use std::fs;
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Output},
+};
 
 use clickhouse::Client;
 use serde::Deserialize;
 
 fn test_url() -> Option<String> {
-    std::env::var("NOMAD_TEST_URL").ok().map(|u| u.trim_end_matches('/').to_string())
+    std::env::var("NOMAD_TEST_URL")
+        .ok()
+        .map(|u| u.trim_end_matches('/').to_string())
 }
 
 macro_rules! require_server {
@@ -31,6 +35,7 @@ struct TestEnv {
     database_url: String,
     db: String,
     source: PathBuf,
+    cleanup_cluster: Option<String>,
 }
 
 impl TestEnv {
@@ -39,7 +44,12 @@ impl TestEnv {
         let source = std::env::temp_dir().join(format!("nomad_it_{db}"));
         let _ = fs::remove_dir_all(&source);
         fs::create_dir_all(&source).unwrap();
-        Self { database_url: format!("{base_url}/{db}"), db, source }
+        Self {
+            database_url: format!("{base_url}/{db}"),
+            db,
+            source,
+            cleanup_cluster: None,
+        }
     }
 
     fn write_migration(&self, version: u64, slug: &str, up: &str, down: &str) {
@@ -54,24 +64,29 @@ impl TestEnv {
             .arg(&self.database_url)
             .env_remove("CLICKHOUSE_URL")
             .env_remove("DATABASE_URL")
+            .env_remove("RUST_LOG")
             .output()
             .expect("failed to spawn nomad binary")
     }
 
     fn run_source(&self, args: &[&str]) -> Output {
+        self.run_source_with_log(args, "")
+    }
+
+    fn run_source_with_log(&self, args: &[&str], log: &str) -> Output {
         let source = self.source.to_str().unwrap().to_string();
         let mut full: Vec<&str> = args.to_vec();
         full.push("--source");
         full.push(&source);
-        let out = Command::new(env!("CARGO_BIN_EXE_nomad"))
+        Command::new(env!("CARGO_BIN_EXE_nomad"))
             .args(&full)
             .arg("--database-url")
             .arg(&self.database_url)
             .env_remove("CLICKHOUSE_URL")
             .env_remove("DATABASE_URL")
+            .env("RUST_LOG", log)
             .output()
-            .expect("failed to spawn nomad binary");
-        out
+            .expect("failed to spawn nomad binary")
     }
 
     fn client(&self, base_url: &str) -> Client {
@@ -96,7 +111,11 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        let _ = self.run(&["database", "drop", "-y"]);
+        if let Some(cluster) = &self.cleanup_cluster {
+            let _ = self.run(&["database", "drop", "--cluster", cluster, "-y", "--force"]);
+        } else {
+            let _ = self.run(&["database", "drop", "-y", "--force"]);
+        }
         let _ = fs::remove_dir_all(&self.source);
     }
 }
@@ -153,7 +172,19 @@ async fn full_lifecycle() {
     );
 
     assert_ok(&env.run(&["database", "create"]));
-    assert_ok(&env.run_source(&["migrate", "run"]));
+    assert_ok(&env.run(&["migrate", "init"]));
+    let out = env.run_source(&["migrate", "run"]);
+    assert_ok(&out);
+    assert!(!stderr(&out).contains("executing statement"));
+    assert_eq!(
+        stderr(&out)
+            .lines()
+            .filter(|line| line.contains(" INFO "))
+            .count(),
+        2
+    );
+    assert!(!stderr(&out).contains("CREATE TABLE events"));
+    assert!(stderr(&out).contains("recorded success in `_nomad_migrations`"));
 
     let info = stdout(&env.run_source(&["migrate", "info"]));
     assert!(info.contains("1/installed create events"), "{info}");
@@ -162,7 +193,7 @@ async fn full_lifecycle() {
     // Idempotent second run.
     let out = env.run_source(&["migrate", "run"]);
     assert_ok(&out);
-    assert!(stdout(&out).contains("no pending migrations"));
+    assert!(stderr(&out).contains("no pending migrations"));
 
     let client = env.client(&base);
     let rows = tracking_rows(&client).await;
@@ -170,7 +201,7 @@ async fn full_lifecycle() {
     assert!(rows.iter().all(|r| r.success));
 
     // Revert the latest only.
-    assert_ok(&env.run_source(&["migrate", "revert"]));
+    assert_ok(&env.run_source(&["migrate", "revert", "--force"]));
     let info = stdout(&env.run_source(&["migrate", "info"]));
     assert!(info.contains("2/pending"), "{info}");
     assert!(info.contains("1/installed"), "{info}");
@@ -198,11 +229,18 @@ async fn dirty_state_blocks_further_runs() {
     );
 
     assert_ok(&env.run(&["database", "create"]));
+    assert_ok(&env.run(&["migrate", "init"]));
     let out = env.run_source(&["migrate", "run"]);
     assert!(!out.status.success());
     let err = stderr(&out);
     assert!(err.contains("statement 2 of 2"), "{err}");
     assert!(err.contains("dirty"), "{err}");
+    assert_eq!(
+        err.lines().filter(|line| line.contains(" INFO ")).count(),
+        1
+    );
+    assert_eq!(err.lines().filter(|line| line.contains("ERROR")).count(), 1);
+    assert!(err.contains("failed to apply 1/bad second statement"));
 
     let client = env.client(&base);
     let rows = tracking_rows(&client).await;
@@ -213,7 +251,11 @@ async fn dirty_state_blocks_further_runs() {
     for cmd in [["migrate", "run"], ["migrate", "revert"]] {
         let out = env.run_source(&cmd);
         assert!(!out.status.success());
-        assert!(stderr(&out).contains("dirty state from migration 1"), "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains("dirty state from migration 1"),
+            "{}",
+            stderr(&out)
+        );
     }
 
     let info = stdout(&env.run_source(&["migrate", "info"]));
@@ -232,6 +274,7 @@ async fn checksum_mismatch_detected() {
         "DROP TABLE t;",
     );
     assert_ok(&env.run(&["database", "create"]));
+    assert_ok(&env.run(&["migrate", "init"]));
     assert_ok(&env.run_source(&["migrate", "run"]));
 
     // Tamper with the applied up file.
@@ -243,11 +286,19 @@ async fn checksum_mismatch_detected() {
 
     let out = env.run_source(&["migrate", "run"]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("has been modified"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("has been modified"),
+        "{}",
+        stderr(&out)
+    );
 
     let info_out = env.run_source(&["migrate", "info"]);
     assert_ok(&info_out);
-    assert!(stdout(&info_out).contains("(checksum mismatch!)"), "{}", stdout(&info_out));
+    assert!(
+        stdout(&info_out).contains("(checksum mismatch!)"),
+        "{}",
+        stdout(&info_out)
+    );
 }
 
 #[tokio::test]
@@ -263,6 +314,7 @@ async fn literal_question_marks_survive() {
         "DROP TABLE q;",
     );
     assert_ok(&env.run(&["database", "create"]));
+    assert_ok(&env.run(&["migrate", "init"]));
     assert_ok(&env.run_source(&["migrate", "run"]));
 
     let client = env.client(&base);
@@ -279,14 +331,25 @@ async fn target_version_and_dry_run() {
     let base = require_server!();
     let env = TestEnv::new(&base, "target");
 
-    env.write_migration(1, "a", "CREATE TABLE a (x UInt8) ENGINE = Memory;", "DROP TABLE a;");
-    env.write_migration(2, "b", "CREATE TABLE b (x UInt8) ENGINE = Memory;", "DROP TABLE b;");
+    env.write_migration(
+        1,
+        "a",
+        "CREATE TABLE a (x UInt8) ENGINE = Memory;",
+        "DROP TABLE a;",
+    );
+    env.write_migration(
+        2,
+        "b",
+        "CREATE TABLE b (x UInt8) ENGINE = Memory;",
+        "DROP TABLE b;",
+    );
     assert_ok(&env.run(&["database", "create"]));
+    assert_ok(&env.run(&["migrate", "init"]));
 
     // Dry run executes nothing.
     let out = env.run_source(&["migrate", "run", "--dry-run"]);
     assert_ok(&out);
-    assert!(stdout(&out).contains("would apply 1/a"), "{}", stdout(&out));
+    assert!(stderr(&out).contains("would apply 1/a"), "{}", stderr(&out));
     let client = env.client(&base);
     assert!(tracking_rows(&client).await.is_empty());
 
@@ -299,8 +362,310 @@ async fn target_version_and_dry_run() {
     // Unknown target errors.
     let out = env.run_source(&["migrate", "run", "--target-version", "99"]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("does not match any local migration"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("does not match any local migration"),
+        "{}",
+        stderr(&out)
+    );
 
     assert_ok(&env.run_source(&["migrate", "run"]));
     assert_eq!(tracking_rows(&client).await.len(), 2);
+}
+
+#[tokio::test]
+async fn manifest_must_be_initialized_explicitly() {
+    let base = require_server!();
+    let env = TestEnv::new(&base, "init");
+    env.write_migration(
+        1,
+        "events",
+        "CREATE TABLE events (id UInt64) ENGINE = Memory;",
+        "DROP TABLE events;",
+    );
+    assert_ok(&env.run(&["database", "create"]));
+    let client = env.client(&base);
+
+    for args in [
+        vec!["migrate", "run"],
+        vec!["migrate", "run", "--dry-run"],
+        vec!["migrate", "revert"],
+        vec!["migrate", "revert", "--dry-run"],
+        vec!["migrate", "info"],
+    ] {
+        let out = env.run_source(&args);
+        assert!(!out.status.success());
+        assert!(
+            stderr(&out).contains("nomad migrate init"),
+            "{}",
+            stderr(&out)
+        );
+        let count = client.query("SELECT count() FROM system.tables WHERE database = currentDatabase() AND name IN ('_nomad_migrations', 'events')")
+            .fetch_one::<u64>().await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    assert_ok(&env.run(&["migrate", "init"]));
+    assert_ok(&env.run(&["migrate", "init"])); // Idempotent, before migrations.
+    assert_ok(&env.run_source(&["migrate", "run"]));
+    let out = env.run(&["migrate", "init"]);
+    assert_ok(&out); // Does not clear history.
+    assert!(stderr(&out).contains("already exists with engine MergeTree"));
+    assert!(stderr(&out).contains("no DDL submitted"));
+    assert!(!stderr(&out).contains("CREATE TABLE"));
+    // A nonexistent cluster would fail if init submitted ON CLUSTER DDL.
+    let out = env.run(&["migrate", "init", "--cluster=nomad_nonexistent_cluster"]);
+    assert_ok(&out);
+    assert!(stderr(&out).contains("no DDL submitted"));
+    let out = env.run(&["migrate", "init", "--replicated"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("incompatible with requested ReplicatedMergeTree()"));
+    assert_eq!(tracking_rows(&client).await.len(), 1);
+    let out = env.run(&["database", "reset", "-y", "--force"]);
+    assert_ok(&out);
+    assert!(stderr(&out).contains("no migrations applied"));
+    let count = client
+        .query("SELECT count() FROM system.tables WHERE database = currentDatabase()")
+        .fetch_one::<u64>()
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let out = env.run_source(&["database", "setup"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("nomad migrate init"));
+    assert_ok(&env.run(&["migrate", "init"]));
+    assert_ok(&env.run_source(&["database", "setup"]));
+    assert_eq!(tracking_rows(&client).await.len(), 1);
+}
+
+#[tokio::test]
+async fn sql_is_only_logged_at_debug() {
+    let base = require_server!();
+    let env = TestEnv::new(&base, "logging");
+    env.write_migration(
+        1,
+        "logging",
+        "CREATE TABLE log_test (id UInt64) ENGINE = Memory;",
+        "DROP TABLE log_test;",
+    );
+    let out = env.run(&["database", "create"]);
+    assert_ok(&out);
+    assert!(stderr(&out).contains("INFO"));
+    assert!(!stderr(&out).contains("CREATE DATABASE"));
+    let out = env.run(&["migrate", "init"]);
+    assert_ok(&out);
+    assert!(!stderr(&out).contains("CREATE TABLE"));
+
+    let out = env.run_source(&["migrate", "run", "--dry-run"]);
+    assert_ok(&out);
+    assert!(stderr(&out).contains("would apply 1/logging"));
+    assert_eq!(
+        stderr(&out)
+            .lines()
+            .filter(|line| line.contains(" INFO "))
+            .count(),
+        1
+    );
+    assert!(!stderr(&out).contains("CREATE TABLE log_test"));
+    assert!(stdout(&out).is_empty());
+    for flag in ["-v", "-vv", "-vvv"] {
+        let out = env.run_source(&["migrate", "run", "--dry-run", flag]);
+        assert_ok(&out);
+        assert!(stderr(&out).contains("CREATE TABLE log_test"));
+        assert!(stderr(&out).contains("DEBUG"));
+    }
+    let out = env.run_source_with_log(&["migrate", "run", "--dry-run", "-v"], "nomad=error");
+    assert_ok(&out);
+    assert!(stderr(&out).contains("CREATE TABLE log_test")); // CLI verbosity overrides Nomad's env directive.
+    let out = env.run_source_with_log(&["migrate", "run", "--dry-run"], "nomad=debug");
+    assert_ok(&out);
+    assert!(stderr(&out).contains("DEBUG"));
+    assert!(stderr(&out).contains("CREATE TABLE log_test"));
+    assert!(tracking_rows(&env.client(&base)).await.is_empty());
+
+    let out = env.run_source_with_log(&["migrate", "run"], "nomad=debug");
+    assert_ok(&out);
+    assert!(stderr(&out).contains("CREATE TABLE log_test"));
+    let out = env.run_source(&["migrate", "revert", "--dry-run"]);
+    assert_ok(&out);
+    assert!(stderr(&out).contains("would revert 1/logging"));
+    assert_eq!(
+        stderr(&out)
+            .lines()
+            .filter(|line| line.contains(" INFO "))
+            .count(),
+        1
+    );
+    assert!(!stderr(&out).contains("DROP TABLE log_test"));
+    let out = env.run_source_with_log(&["migrate", "revert", "--dry-run"], "debug");
+    assert_ok(&out);
+    assert!(stderr(&out).contains("DROP TABLE log_test"));
+    let out = env.run_source(&["migrate", "revert"]);
+    assert_ok(&out);
+    assert!(stderr(&out).contains("reverted 1/logging"));
+    assert_eq!(
+        stderr(&out)
+            .lines()
+            .filter(|line| line.contains(" INFO "))
+            .count(),
+        1
+    );
+    assert!(!stderr(&out).contains("DROP TABLE log_test"));
+}
+
+#[tokio::test]
+async fn incompatible_database_engine_is_rejected_before_reset() {
+    let base = require_server!();
+    let env = TestEnv::new(&base, "db_engine");
+    assert_ok(&env.run(&["database", "create"]));
+    assert_ok(&env.run(&["migrate", "init"]));
+    let out = env.run(&["database", "create"]);
+    assert_ok(&out);
+    assert!(stderr(&out).contains("no DDL submitted"));
+    for args in [
+        vec!["database", "create", "--replicated"],
+        vec!["database", "setup", "--replicated"],
+        vec!["database", "reset", "--replicated", "-y"],
+    ] {
+        let out = env.run(&args);
+        assert!(!out.status.success());
+        assert!(
+            stderr(&out).contains("incompatible with requested Replicated"),
+            "{}",
+            stderr(&out)
+        );
+    }
+    assert!(tracking_rows(&env.client(&base)).await.is_empty()); // Reset did not remove the manifest.
+}
+
+#[tokio::test]
+async fn replicated_database_on_cluster() {
+    let base = require_server!();
+    let Ok(cluster) = std::env::var("NOMAD_TEST_CLUSTER") else {
+        eprintln!("skipped: NOMAD_TEST_CLUSTER not set");
+        return;
+    };
+    let mut env = TestEnv::new(&base, "replicated_db");
+    env.cleanup_cluster = Some(cluster.clone());
+    let engine = || {
+        env.client(&base)
+            .query("SELECT engine FROM system.databases WHERE name = ?")
+            .bind(&env.db)
+            .fetch_one::<String>()
+    };
+    let result = async {
+        assert_ok(&env.run(&["database", "create", "--replicated", "--cluster", &cluster]));
+        assert_eq!(engine().await.unwrap(), "Replicated");
+        let out = env.run(&["database", "reset", "-y", "--force"]);
+        assert!(!out.status.success()); // No accidental downgrade to the default engine.
+        assert_eq!(engine().await.unwrap(), "Replicated");
+        assert_ok(&env.run(&["migrate", "init", "--replicated"]));
+        assert_ok(&env.run(&[
+            "database",
+            "reset",
+            "--replicated",
+            "--cluster",
+            &cluster,
+            "-y",
+        ]));
+        assert_eq!(engine().await.unwrap(), "Replicated");
+        let tables = env
+            .client(&base)
+            .query("SELECT count() FROM system.tables WHERE database = currentDatabase()")
+            .fetch_one::<u64>()
+            .await
+            .unwrap();
+        assert_eq!(tables, 0); // Reset never initializes the manifest.
+        let ch = env.client(&base);
+        ch.query("CREATE TABLE guard (id UInt64) ENGINE = ReplicatedMergeTree ORDER BY id")
+            .execute()
+            .await
+            .unwrap();
+        ch.query("INSERT INTO guard VALUES (1)")
+            .execute()
+            .await
+            .unwrap();
+        let out = env.run(&[
+            "database",
+            "reset",
+            "--replicated",
+            "--cluster",
+            &cluster,
+            "-y",
+        ]);
+        assert!(!out.status.success());
+        assert!(stderr(&out).contains("no DROP submitted"));
+        assert_eq!(
+            ch.query("SELECT count() FROM guard")
+                .fetch_one::<u64>()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_ok(&env.run(&[
+            "database",
+            "reset",
+            "--replicated",
+            "--cluster",
+            &cluster,
+            "-y",
+            "--force",
+        ]));
+    };
+    result.await;
+    assert_ok(&env.run(&["database", "drop", "--cluster", &cluster, "-y", "--force"]));
+}
+
+#[tokio::test]
+async fn destructive_commands_require_force_for_merge_tree_data() {
+    let base = require_server!();
+    let env = TestEnv::new(&base, "drop_guard");
+    env.write_migration(1, "protected", "CREATE TABLE protected (id UInt64) ENGINE = MergeTree ORDER BY id; INSERT INTO protected VALUES (42);", "DROP TABLE protected;");
+    assert_ok(&env.run(&["database", "create"]));
+    assert_ok(&env.run(&["migrate", "init"]));
+    assert_ok(&env.run_source(&["migrate", "run"]));
+    let client = env.client(&base);
+    let out = env.run_source(&["migrate", "revert", "--dry-run"]);
+    assert_ok(&out);
+    for args in [
+        vec!["migrate", "revert"],
+        vec!["database", "drop", "-y"],
+        vec!["database", "reset", "-y"],
+    ] {
+        let out = if args[0] == "migrate" {
+            env.run_source(&args)
+        } else {
+            env.run(&args)
+        };
+        assert!(!out.status.success());
+        assert!(
+            stderr(&out).contains("TABLE_SIZE_EXCEEDS_MAX_DROP_SIZE_LIMIT")
+                || stderr(&out).contains("max_table_size_to_drop=1"),
+            "{}",
+            stderr(&out)
+        );
+        assert_eq!(
+            client
+                .query("SELECT count() FROM protected")
+                .fetch_one::<u64>()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(tracking_rows(&client).await.len(), 1);
+    }
+    assert_ok(&env.run_source(&["migrate", "revert", "--force"]));
+    assert!(tracking_rows(&client).await.is_empty());
+    assert_ok(&env.run_source(&["migrate", "run"]));
+    assert_ok(&env.run(&["database", "reset", "-y", "--force"]));
+    assert_eq!(
+        client
+            .query("SELECT count() FROM system.tables WHERE database = currentDatabase()")
+            .fetch_one::<u64>()
+            .await
+            .unwrap(),
+        0
+    );
+    assert_ok(&env.run(&["migrate", "init"]));
+    assert_ok(&env.run_source(&["migrate", "run"]));
+    assert_ok(&env.run(&["database", "drop", "-y", "--force"]));
 }

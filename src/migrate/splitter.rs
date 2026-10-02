@@ -115,7 +115,10 @@ mod tests {
     #[test]
     fn splits_simple_statements() {
         let got = split_statements("CREATE TABLE a (x Int64) ENGINE = Memory;\nDROP TABLE a;");
-        assert_eq!(got, vec!["CREATE TABLE a (x Int64) ENGINE = Memory", "DROP TABLE a"]);
+        assert_eq!(
+            got,
+            vec!["CREATE TABLE a (x Int64) ENGINE = Memory", "DROP TABLE a"]
+        );
     }
 
     #[test]
@@ -151,13 +154,19 @@ mod tests {
     #[test]
     fn semicolon_inside_backtick_identifier() {
         let got = split_statements("CREATE TABLE `weird;name` (x Int64) ENGINE = Memory;");
-        assert_eq!(got, vec!["CREATE TABLE `weird;name` (x Int64) ENGINE = Memory"]);
+        assert_eq!(
+            got,
+            vec!["CREATE TABLE `weird;name` (x Int64) ENGINE = Memory"]
+        );
     }
 
     #[test]
     fn semicolon_inside_double_quoted_identifier() {
         let got = split_statements(r#"CREATE TABLE "weird;name" (x Int64) ENGINE = Memory;"#);
-        assert_eq!(got, vec![r#"CREATE TABLE "weird;name" (x Int64) ENGINE = Memory"#]);
+        assert_eq!(
+            got,
+            vec![r#"CREATE TABLE "weird;name" (x Int64) ENGINE = Memory"#]
+        );
     }
 
     #[test]
@@ -180,8 +189,13 @@ mod tests {
 
     #[test]
     fn leading_comment_is_kept_with_statement() {
-        let got = split_statements("-- adds the users table\nCREATE TABLE users (id UInt64) ENGINE = Memory;");
-        assert_eq!(got, vec!["-- adds the users table\nCREATE TABLE users (id UInt64) ENGINE = Memory"]);
+        let got = split_statements(
+            "-- adds the users table\nCREATE TABLE users (id UInt64) ENGINE = Memory;",
+        );
+        assert_eq!(
+            got,
+            vec!["-- adds the users table\nCREATE TABLE users (id UInt64) ENGINE = Memory"]
+        );
     }
 
     #[test]

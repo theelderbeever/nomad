@@ -1,6 +1,8 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -49,17 +51,21 @@ pub fn discover(dir: &Path) -> Result<Vec<Migration>> {
         }
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            eprintln!("warning: skipping non-UTF-8 filename in {}", dir.display());
+            tracing::warn!("skipping non-UTF-8 filename in {}", dir.display());
             continue;
         };
         let Some((version, description, is_up)) = parse_filename(name) else {
-            eprintln!("warning: skipping {name:?} (not a <version>_<description>.{{up,down}}.sql file)");
+            tracing::warn!(
+                "skipping {name:?} (not a <version>_<description>.{{up,down}}.sql file)"
+            );
             continue;
         };
 
-        let pair = pairs
-            .entry(version)
-            .or_insert_with(|| Pair { description: description.clone(), up: None, down: None });
+        let pair = pairs.entry(version).or_insert_with(|| Pair {
+            description: description.clone(),
+            up: None,
+            down: None,
+        });
         let slot = if is_up { &mut pair.up } else { &mut pair.down };
         if let Some(existing) = slot {
             bail!(
@@ -78,7 +84,9 @@ pub fn discover(dir: &Path) -> Result<Vec<Migration>> {
     for (version, pair) in pairs {
         let (up_path, down_path) = match (pair.up, pair.down) {
             (Some(up), Some(down)) => (up, down),
-            (Some(_), None) => bail!("migration {version} has an up file but no matching .down.sql"),
+            (Some(_), None) => {
+                bail!("migration {version} has an up file but no matching .down.sql")
+            }
             (None, Some(_)) => bail!("migration {version} has a down file but no matching .up.sql"),
             (None, None) => unreachable!(),
         };
@@ -206,7 +214,10 @@ mod tests {
 
     #[test]
     fn parse_filename_grammar() {
-        assert_eq!(parse_filename("20260101000000_add_users.up.sql"), Some((20260101000000, "add_users".into(), true)));
+        assert_eq!(
+            parse_filename("20260101000000_add_users.up.sql"),
+            Some((20260101000000, "add_users".into(), true))
+        );
         assert_eq!(parse_filename("1_x.down.sql"), Some((1, "x".into(), false)));
         assert_eq!(parse_filename("nope.sql"), None);
         assert_eq!(parse_filename("1_x.sql"), None); // single-file migrations unsupported
@@ -218,9 +229,19 @@ mod tests {
     fn add_creates_pair_and_refuses_overwrite() {
         let dir = temp_dir("add");
         let (up, down) = add_migration(&dir, "Add Users!").unwrap();
-        assert!(up.file_name().unwrap().to_str().unwrap().ends_with("_add_users.up.sql"));
+        assert!(
+            up.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("_add_users.up.sql")
+        );
         assert!(down.exists());
-        assert!(fs::read_to_string(&up).unwrap().contains("Add up migration"));
+        assert!(
+            fs::read_to_string(&up)
+                .unwrap()
+                .contains("Add up migration")
+        );
     }
 
     #[test]

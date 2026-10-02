@@ -1,18 +1,17 @@
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::time::Instant;
+use std::{collections::BTreeMap, path::Path, time::Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clickhouse::Client;
 use serde::{Deserialize, Serialize};
 
-use super::checksum::{CHECKSUM_LEN, checksum};
-use super::source::{self, Migration};
-use super::splitter::split_statements;
+use super::{
+    checksum::{CHECKSUM_LEN, checksum},
+    manifest::{TRACKING_TABLE, require_tracking_table},
+    source::{self, Migration},
+    splitter::split_statements,
+};
 use crate::client;
-
-pub const TRACKING_TABLE: &str = "_nomad_migrations";
 
 #[derive(Debug, Clone, clickhouse::Row, Serialize, Deserialize)]
 pub struct MigrationRow {
@@ -31,9 +30,11 @@ pub struct MigrationRow {
 /// because serde only derives arrays up to 32 elements.
 mod fixed_bytes {
     use super::CHECKSUM_LEN;
-    use serde::de::{Error as _, SeqAccess, Visitor};
-    use serde::ser::SerializeTuple;
-    use serde::{Deserializer, Serializer};
+    use serde::{
+        Deserializer, Serializer,
+        de::{Error as _, SeqAccess, Visitor},
+        ser::SerializeTuple,
+    };
 
     pub fn serialize<S: Serializer>(v: &[u8; CHECKSUM_LEN], s: S) -> Result<S::Ok, S::Error> {
         let mut tuple = s.serialize_tuple(CHECKSUM_LEN)?;
@@ -55,29 +56,15 @@ mod fixed_bytes {
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut out = [0u8; CHECKSUM_LEN];
                 for (i, slot) in out.iter_mut().enumerate() {
-                    *slot = seq.next_element()?.ok_or_else(|| A::Error::invalid_length(i, &self))?;
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(i, &self))?;
                 }
                 Ok(out)
             }
         }
         d.deserialize_tuple(CHECKSUM_LEN, BytesVisitor)
     }
-}
-
-pub async fn ensure_tracking_table(ch: &Client) -> Result<()> {
-    ch.query(&format!(
-        "CREATE TABLE IF NOT EXISTS `{TRACKING_TABLE}` (
-            version           Int64,
-            description       String,
-            installed_on      DateTime64(3, 'UTC'),
-            success           Bool,
-            checksum          FixedString({CHECKSUM_LEN}),
-            execution_time_ms UInt64
-        ) ENGINE = MergeTree ORDER BY version"
-    ))
-    .execute()
-    .await
-    .context("failed to create the migration tracking table")
 }
 
 pub async fn fetch_applied(ch: &Client) -> Result<Vec<MigrationRow>> {
@@ -133,8 +120,8 @@ pub async fn run(
     target_version: Option<i64>,
     dry_run: bool,
 ) -> Result<()> {
+    require_tracking_table(ch).await?;
     let migrations = source::discover(source_dir)?;
-    ensure_tracking_table(ch).await?;
     let applied = fetch_applied(ch).await?;
     verify_applied(&applied, &by_version(&migrations))?;
 
@@ -142,13 +129,13 @@ pub async fn run(
         if !migrations.iter().any(|m| m.version == target) {
             bail!("--target-version {target} does not match any local migration");
         }
-        if let Some(max_applied) = applied.iter().map(|r| r.version).max() {
-            if target < max_applied {
-                bail!(
-                    "--target-version {target} is below the latest applied migration ({max_applied}); \
+        if let Some(max_applied) = applied.iter().map(|r| r.version).max()
+            && target < max_applied
+        {
+            bail!(
+                "--target-version {target} is below the latest applied migration ({max_applied}); \
                      use `migrate revert --target-version {target}` to go backwards"
-                );
-            }
+            );
         }
     }
 
@@ -160,12 +147,22 @@ pub async fn run(
         .collect();
 
     if pending.is_empty() {
-        println!("no pending migrations");
+        tracing::info!("no pending migrations");
         return Ok(());
     }
 
     for migration in pending {
-        apply_one(ch, migration, dry_run).await?;
+        if let Err(err) = apply_one(ch, migration, dry_run).await {
+            tracing::info!(
+                "failed to apply {}/{}",
+                migration.version,
+                migration.description
+            );
+            return Err(err.context(format!(
+                "failed to apply migration {}/{}",
+                migration.version, migration.description
+            )));
+        }
     }
     Ok(())
 }
@@ -173,17 +170,26 @@ pub async fn run(
 async fn apply_one(ch: &Client, migration: &Migration, dry_run: bool) -> Result<()> {
     let statements = split_statements(&migration.up_sql);
     if dry_run {
-        println!("would apply {}/{}:", migration.version, migration.description);
+        tracing::info!(
+            "would apply {}/{} and record success in `{TRACKING_TABLE}`",
+            migration.version,
+            migration.description
+        );
         for stmt in &statements {
-            println!("    {stmt};");
+            tracing::debug!("would execute SQL:\n{stmt};");
         }
-        println!("    -- then record version {} in `{TRACKING_TABLE}`", migration.version);
         return Ok(());
     }
 
     let started = Instant::now();
     let total = statements.len();
+    tracing::debug!(
+        "applying {}/{} ({total} statements)",
+        migration.version,
+        migration.description
+    );
     for (i, stmt) in statements.iter().enumerate() {
+        tracing::debug!("executing statement {}/{total}", i + 1);
         if let Err(err) = client::execute(ch, stmt).await {
             let elapsed_ms = started.elapsed().as_millis() as u64;
             record(ch, migration, false, elapsed_ms)
@@ -201,11 +207,20 @@ async fn apply_one(ch: &Client, migration: &Migration, dry_run: bool) -> Result<
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
     record(ch, migration, true, elapsed_ms).await?;
-    println!("applied {}/{} ({elapsed_ms}ms)", migration.version, migration.description);
+    tracing::info!(
+        "applied {}/{} ({elapsed_ms}ms); recorded success in `{TRACKING_TABLE}`",
+        migration.version,
+        migration.description
+    );
     Ok(())
 }
 
-async fn record(ch: &Client, migration: &Migration, success: bool, execution_time_ms: u64) -> Result<()> {
+async fn record(
+    ch: &Client,
+    migration: &Migration,
+    success: bool,
+    execution_time_ms: u64,
+) -> Result<()> {
     let mut insert = ch.insert::<MigrationRow>(TRACKING_TABLE).await?;
     insert
         .write(&MigrationRow {
@@ -217,7 +232,10 @@ async fn record(ch: &Client, migration: &Migration, success: bool, execution_tim
             execution_time_ms,
         })
         .await?;
-    insert.end().await.context("failed to record migration in the tracking table")
+    insert
+        .end()
+        .await
+        .context("failed to record migration in the tracking table")
 }
 
 pub async fn revert(
@@ -226,9 +244,9 @@ pub async fn revert(
     target_version: Option<i64>,
     dry_run: bool,
 ) -> Result<()> {
+    require_tracking_table(ch).await?;
     let migrations = source::discover(source_dir)?;
     let local = by_version(&migrations);
-    ensure_tracking_table(ch).await?;
     let applied = fetch_applied(ch).await?;
     verify_applied(&applied, &local)?;
 
@@ -244,13 +262,23 @@ pub async fn revert(
     }
 
     if to_revert.is_empty() {
-        println!("no migrations to revert");
+        tracing::info!("no migrations to revert");
         return Ok(());
     }
 
     for version in to_revert {
         let migration = local[&version]; // verified present above
-        revert_one(ch, migration, dry_run).await?;
+        if let Err(err) = revert_one(ch, migration, dry_run).await {
+            tracing::info!(
+                "failed to revert {}/{}",
+                migration.version,
+                migration.description
+            );
+            return Err(err.context(format!(
+                "failed to revert migration {}/{}",
+                migration.version, migration.description
+            )));
+        }
     }
     Ok(())
 }
@@ -258,17 +286,26 @@ pub async fn revert(
 async fn revert_one(ch: &Client, migration: &Migration, dry_run: bool) -> Result<()> {
     let statements = split_statements(&migration.down_sql);
     if dry_run {
-        println!("would revert {}/{}:", migration.version, migration.description);
+        tracing::info!(
+            "would revert {}/{} and delete tracking row from `{TRACKING_TABLE}`",
+            migration.version,
+            migration.description
+        );
         for stmt in &statements {
-            println!("    {stmt};");
+            tracing::debug!("would execute SQL:\n{stmt};");
         }
-        println!("    -- then delete version {} from `{TRACKING_TABLE}`", migration.version);
         return Ok(());
     }
 
     let started = Instant::now();
     let total = statements.len();
+    tracing::debug!(
+        "reverting {}/{} ({total} statements)",
+        migration.version,
+        migration.description
+    );
     for (i, stmt) in statements.iter().enumerate() {
+        tracing::debug!("executing statement {}/{total}", i + 1);
         client::execute(ch, stmt).await.with_context(|| {
             format!(
                 "revert of migration {} ({}) failed at statement {} of {total}; \
@@ -296,13 +333,17 @@ async fn revert_one(ch: &Client, migration: &Migration, dry_run: bool) -> Result
     )?;
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    println!("reverted {}/{} ({elapsed_ms}ms)", migration.version, migration.description);
+    tracing::info!(
+        "reverted {}/{} ({elapsed_ms}ms); deleted tracking row from `{TRACKING_TABLE}`",
+        migration.version,
+        migration.description
+    );
     Ok(())
 }
 
 pub async fn info(ch: &Client, source_dir: &Path) -> Result<()> {
+    require_tracking_table(ch).await?;
     let migrations = source::discover(source_dir)?;
-    ensure_tracking_table(ch).await?;
     let applied = fetch_applied(ch).await?;
     let applied_by_version: BTreeMap<i64, &MigrationRow> =
         applied.iter().map(|r| (r.version, r)).collect();
@@ -318,11 +359,17 @@ pub async fn info(ch: &Client, source_dir: &Path) -> Result<()> {
             }
             Some(_) => ("installed", ""),
         };
-        println!("{}/{status} {}{note}", migration.version, migration.description);
+        println!(
+            "{}/{status} {}{note}",
+            migration.version, migration.description
+        );
     }
     for row in &applied {
         if !seen.contains(&row.version) {
-            println!("{}/installed {} (missing local file!)", row.version, row.description);
+            println!(
+                "{}/installed {} (missing local file!)",
+                row.version, row.description
+            );
         }
     }
     Ok(())
