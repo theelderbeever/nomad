@@ -1,5 +1,28 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use url::Url;
+
+/// A nonempty cluster name, parsed before any database operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterName(String);
+
+impl std::str::FromStr for ClusterName {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        ensure!(!raw.trim().is_empty(), "--cluster must not be empty");
+        ensure!(
+            !raw.contains('\0'),
+            "--cluster must not contain a NUL character"
+        );
+        Ok(Self(raw.to_owned()))
+    }
+}
+
+impl ClusterName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -12,7 +35,11 @@ pub struct ConnectOptions {
 
 /// Resolve the connection URL: --database-url flag > CLICKHOUSE_URL > DATABASE_URL.
 pub fn resolve_url(flag: Option<String>) -> Result<String> {
-    resolve_url_from(flag, std::env::var("CLICKHOUSE_URL").ok(), std::env::var("DATABASE_URL").ok())
+    resolve_url_from(
+        flag,
+        std::env::var("CLICKHOUSE_URL").ok(),
+        std::env::var("DATABASE_URL").ok(),
+    )
 }
 
 fn resolve_url_from(
@@ -31,7 +58,9 @@ pub fn parse_url(raw: &str) -> Result<ConnectOptions> {
     let (scheme, default_port) = match url.scheme() {
         "http" | "clickhouse" => ("http", 8123),
         "https" | "clickhouses" => ("https", 8443),
-        other => bail!("unsupported URL scheme {other:?} (expected http, https, clickhouse, or clickhouses)"),
+        other => bail!(
+            "unsupported URL scheme {other:?} (expected http, https, clickhouse, or clickhouses)"
+        ),
     };
 
     let host = url.host_str().context("database URL has no host")?;
@@ -52,10 +81,15 @@ pub fn parse_url(raw: &str) -> Result<ConnectOptions> {
         .unwrap_or_else(|| "default".to_string());
 
     for (key, _) in url.query_pairs() {
-        eprintln!("warning: ignoring unsupported URL query parameter {key:?}");
+        tracing::warn!("ignoring unsupported URL query parameter {key:?}");
     }
 
-    Ok(ConnectOptions { endpoint: format!("{scheme}://{host}:{port}"), user, password, database })
+    Ok(ConnectOptions {
+        endpoint: format!("{scheme}://{host}:{port}"),
+        user,
+        password,
+        database,
+    })
 }
 
 /// The url crate keeps userinfo and path segments percent-encoded; decode them.
@@ -146,8 +180,14 @@ mod tests {
 
     #[test]
     fn empty_path_means_default_database() {
-        assert_eq!(parse_url("http://localhost:8123").unwrap().database, "default");
-        assert_eq!(parse_url("http://localhost:8123/").unwrap().database, "default");
+        assert_eq!(
+            parse_url("http://localhost:8123").unwrap().database,
+            "default"
+        );
+        assert_eq!(
+            parse_url("http://localhost:8123/").unwrap().database,
+            "default"
+        );
     }
 
     #[test]

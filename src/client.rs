@@ -3,6 +3,31 @@ use clickhouse::Client;
 
 use crate::config::ConnectOptions;
 
+/// Restrict destructive commands unless the caller explicitly opts into data loss.
+#[derive(Debug, Clone, Copy)]
+pub enum DropPolicy {
+    Protected,
+    Forced,
+}
+
+impl DropPolicy {
+    pub fn is_protected(self) -> bool {
+        matches!(self, Self::Protected)
+    }
+
+    pub fn client(self, client: Client) -> Client {
+        let limit = match self {
+            Self::Protected => "1",
+            Self::Forced => "0",
+        };
+        tracing::debug!(
+            max_table_size_to_drop = limit,
+            "setting drop-size protection"
+        );
+        client.with_setting("max_table_size_to_drop", limit)
+    }
+}
+
 /// Client scoped to the target database, for running migrations.
 pub fn connect(opts: &ConnectOptions) -> Client {
     base_client(opts)
@@ -29,6 +54,11 @@ fn base_client(opts: &ConnectOptions) -> Client {
     client
 }
 
+/// Quote a ClickHouse identifier, preserving literal backslashes and backticks.
+pub fn quote_identifier(name: &str) -> String {
+    format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
+}
+
 /// The clickhouse crate treats `?` in query text as a bind placeholder and
 /// `??` as an escaped literal `?`. Migration SQL is never bound, so escape
 /// every `?` before sending user-authored statements.
@@ -37,11 +67,12 @@ pub fn escape_placeholders(stmt: &str) -> String {
 }
 
 pub async fn execute(client: &Client, stmt: &str) -> Result<()> {
+    tracing::debug!("executing SQL:\n{stmt};");
     client
         .query(&escape_placeholders(stmt))
         .execute()
         .await
-        .with_context(|| format!("failed to execute statement:\n{stmt}"))
+        .context("failed to execute statement")
 }
 
 #[cfg(test)]
