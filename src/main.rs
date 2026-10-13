@@ -6,14 +6,33 @@ mod migrate;
 
 use std::{io::IsTerminal, path::Path};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use inquire::{Password, PasswordDisplayMode};
 
 use cli::{Cli, Command, DatabaseCmd, DatabaseUrlArg, MigrateCmd};
 use config::ConnectOptions;
 
 fn connect_options(url: DatabaseUrlArg) -> Result<ConnectOptions> {
-    config::parse_url(&config::resolve_url(url.database_url)?)
+    connect_options_with(url, || {
+        Password::new("Database URL:")
+            .with_display_mode(PasswordDisplayMode::Masked)
+            .without_confirmation()
+            .prompt()
+            .context("could not read database URL from masked prompt")
+    })
+}
+
+fn connect_options_with(
+    url: DatabaseUrlArg,
+    prompt: impl FnOnce() -> Result<String>,
+) -> Result<ConnectOptions> {
+    let raw = if url.ask {
+        prompt()?
+    } else {
+        config::resolve_url(url.database_url)?
+    };
+    config::parse_url(&raw)
 }
 
 fn with_verbosity(
@@ -153,6 +172,58 @@ async fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_uses_prompted_url_and_parses_it() {
+        let opts = connect_options_with(
+            DatabaseUrlArg {
+                database_url: None,
+                ask: true,
+            },
+            || Ok("http://user:secret@localhost/prompted".into()),
+        )
+        .unwrap();
+        assert_eq!(opts.database, "prompted");
+        assert_eq!(opts.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn explicit_url_does_not_prompt() {
+        let opts = connect_options_with(
+            DatabaseUrlArg {
+                database_url: Some("http://localhost/explicit".into()),
+                ask: false,
+            },
+            || panic!("unexpected prompt"),
+        )
+        .unwrap();
+        assert_eq!(opts.database, "explicit");
+    }
+
+    #[test]
+    fn ask_errors_do_not_fall_back() {
+        for input in ["", "invalid"] {
+            assert!(
+                connect_options_with(
+                    DatabaseUrlArg {
+                        database_url: None,
+                        ask: true
+                    },
+                    || Ok(input.into()),
+                )
+                .is_err()
+            );
+        }
+        let error = connect_options_with(
+            DatabaseUrlArg {
+                database_url: None,
+                ask: true,
+            },
+            || anyhow::bail!("prompt canceled"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "prompt canceled");
+    }
 
     #[test]
     fn verbosity_only_increases_nomad_logging() {
