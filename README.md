@@ -36,6 +36,8 @@ Common flags:
 - `--source <DIR>` — migration directory (default `migrations`)
 - `--database-url <URL>` — falls back to `CLICKHOUSE_URL`, then `DATABASE_URL`
   (a `.env` file is loaded if present)
+- `--ask` — prompt for the database URL with input hidden; ignores environment
+  URLs and conflicts with `--database-url`, e.g. `nomad migrate run --ask`
 - `--target-version <V>` — run up to / revert down to a version
 - `--dry-run` — preview migration actions without executing them (SQL at debug)
 - `--force` — disable the drop-size limit on `migrate revert`, `database drop`, and

@@ -16,6 +16,11 @@ clap = { version = "4.5", features = ["derive"] }
 clickhouse = { version = "0.15", features = ["chrono", "rustls-tls"] }
 dotenvy = "0.15"
 hex = "0.4"
+inquire = {
+  version = "0.9",
+  default-features = false,
+  features = ["crossterm"]
+}
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

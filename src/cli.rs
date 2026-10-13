@@ -44,6 +44,9 @@ pub struct DatabaseUrlArg {
     /// (falls back to CLICKHOUSE_URL, then DATABASE_URL)
     #[arg(long)]
     pub database_url: Option<String>,
+    /// Prompt for the database URL with input hidden (ignores environment URLs)
+    #[arg(long, conflicts_with = "database_url")]
+    pub ask: bool,
 }
 
 #[derive(Args)]
@@ -209,6 +212,37 @@ mod tests {
     use clap::error::ErrorKind;
 
     const MANIFEST_COMMANDS: [[&str; 2]; 1] = [["migrate", "init"]];
+
+    #[test]
+    fn ask_is_available_for_connection_commands_and_conflicts_with_url() {
+        for (category, command) in [
+            ("migrate", "init"),
+            ("migrate", "run"),
+            ("migrate", "revert"),
+            ("migrate", "info"),
+            ("database", "create"),
+            ("database", "drop"),
+            ("database", "setup"),
+            ("database", "reset"),
+        ] {
+            assert!(Cli::try_parse_from(["nomad", category, command, "--ask"]).is_ok());
+            let error = Cli::try_parse_from([
+                "nomad",
+                category,
+                command,
+                "--ask",
+                "--database-url",
+                "http://localhost",
+            ])
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        }
+        let error = Cli::try_parse_from(["nomad", "migrate", "add", "events", "--ask"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
 
     #[test]
     fn force_is_available_only_for_destructive_commands() {
