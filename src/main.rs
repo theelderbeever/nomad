@@ -16,10 +16,10 @@ use config::ConnectOptions;
 fn connect_options(url: DatabaseUrlArg) -> Result<ConnectOptions> {
     connect_options_with(url, || {
         Password::new("Database URL:")
-            .with_display_mode(PasswordDisplayMode::Hidden)
+            .with_display_mode(PasswordDisplayMode::Masked)
             .without_confirmation()
             .prompt()
-            .context("could not read database URL from hidden prompt")
+            .context("could not read database URL from masked prompt")
     })
 }
 

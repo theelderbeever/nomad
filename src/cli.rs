@@ -44,7 +44,7 @@ pub struct DatabaseUrlArg {
     /// (falls back to CLICKHOUSE_URL, then DATABASE_URL)
     #[arg(long)]
     pub database_url: Option<String>,
-    /// Prompt for the database URL with input hidden (ignores environment URLs)
+    /// Prompt for the database URL with input masked by asterisks (ignores environment URLs)
     #[arg(long, conflicts_with = "database_url")]
     pub ask: bool,
 }
