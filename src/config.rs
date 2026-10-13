@@ -48,19 +48,17 @@ fn resolve_url_from(
     database_url: Option<String>,
 ) -> Result<String> {
     flag.or(clickhouse_url).or(database_url).context(
-        "no database URL provided; pass --database-url or set CLICKHOUSE_URL or DATABASE_URL",
+        "no database URL provided; pass --database-url, use --ask, or set CLICKHOUSE_URL or DATABASE_URL",
     )
 }
 
 pub fn parse_url(raw: &str) -> Result<ConnectOptions> {
-    let url = Url::parse(raw).with_context(|| format!("invalid database URL {raw:?}"))?;
+    let url = Url::parse(raw).context("invalid database URL")?;
 
     let (scheme, default_port) = match url.scheme() {
         "http" | "clickhouse" => ("http", 8123),
         "https" | "clickhouses" => ("https", 8443),
-        other => bail!(
-            "unsupported URL scheme {other:?} (expected http, https, clickhouse, or clickhouses)"
-        ),
+        _ => bail!("unsupported URL scheme (expected http, https, clickhouse, or clickhouses)"),
     };
 
     let host = url.host_str().context("database URL has no host")?;
@@ -108,14 +106,14 @@ fn percent_decode(s: &str) -> Result<String> {
                     out.push((hi * 16 + lo) as u8);
                     i += 3;
                 }
-                None => bail!("invalid percent-encoding in URL component {s:?}"),
+                None => bail!("invalid percent-encoding in URL component"),
             }
         } else {
             out.push(bytes[i]);
             i += 1;
         }
     }
-    String::from_utf8(out).with_context(|| format!("URL component {s:?} is not valid UTF-8"))
+    String::from_utf8(out).context("URL component is not valid UTF-8")
 }
 
 #[cfg(test)]
@@ -200,5 +198,19 @@ mod tests {
     #[test]
     fn rejects_unknown_scheme() {
         assert!(parse_url("postgres://localhost/mydb").is_err());
+    }
+
+    #[test]
+    fn parsing_errors_do_not_disclose_credentials() {
+        for raw in [
+            "http://user:secret@localhost:invalid/mydb",
+            "secret://localhost/mydb",
+            "http://user:secret%ZZ@localhost/mydb",
+            "http://user:secret%FF@localhost/mydb",
+        ] {
+            let error = format!("{:#}", parse_url(raw).unwrap_err());
+            assert!(!error.contains("secret"), "{error}");
+            assert!(!error.contains(raw), "{error}");
+        }
     }
 }
