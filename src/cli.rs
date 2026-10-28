@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::{
     client::DropPolicy,
-    config::ClusterName,
+    config::{ClusterName, DatabaseName, MigrationDirectory, ServerUrl},
     db::{DatabaseDefinition, DatabaseEngine},
     migrate::manifest::ManifestTable,
 };
@@ -27,25 +27,27 @@ pub enum Command {
     #[command(subcommand)]
     Migrate(MigrateCmd),
     /// Create and drop the database
-    #[command(subcommand)]
+    #[command(subcommand, visible_alias = "db")]
     Database(DatabaseCmd),
 }
 
 #[derive(Args)]
 pub struct SourceArg {
-    /// Path to the directory containing migration files
-    #[arg(long, default_value = "migrations")]
-    pub source: String,
+    /// Migration directory; prompts with directory completion if missing
+    #[arg(long)]
+    pub source: Option<MigrationDirectory>,
 }
 
 #[derive(Args)]
-pub struct DatabaseUrlArg {
-    /// ClickHouse URL, e.g. http://user:pass@localhost:8123/mydb
-    /// (falls back to CLICKHOUSE_URL, then DATABASE_URL)
+pub struct ConnectionArgs {
+    /// ClickHouse server URL (or CLICKHOUSE_URL); prompts with masked input if missing
     #[arg(long)]
-    pub database_url: Option<String>,
-    /// Prompt for the database URL with input masked by asterisks (ignores environment URLs)
-    #[arg(long, conflicts_with = "database_url")]
+    pub url: Option<ServerUrl>,
+    /// Database name (or CLICKHOUSE_DATABASE); prompts in plain text if missing
+    #[arg(long, visible_alias = "db", env = "CLICKHOUSE_DATABASE")]
+    pub database: Option<DatabaseName>,
+    /// Prompt for the server URL with masked input (ignores CLICKHOUSE_URL)
+    #[arg(long, conflicts_with = "url")]
     pub ask: bool,
 }
 
@@ -113,7 +115,7 @@ pub enum MigrateCmd {
     /// Create the migration manifest table in an existing database
     Init {
         #[command(flatten)]
-        url: DatabaseUrlArg,
+        url: ConnectionArgs,
         #[command(flatten)]
         manifest: ManifestArgs,
     },
@@ -129,7 +131,7 @@ pub enum MigrateCmd {
         #[command(flatten)]
         source: SourceArg,
         #[command(flatten)]
-        url: DatabaseUrlArg,
+        url: ConnectionArgs,
         /// Apply pending migrations up to and including this version
         #[arg(long)]
         target_version: Option<i64>,
@@ -142,7 +144,7 @@ pub enum MigrateCmd {
         #[command(flatten)]
         source: SourceArg,
         #[command(flatten)]
-        url: DatabaseUrlArg,
+        url: ConnectionArgs,
         #[command(flatten)]
         force: ForceArg,
         /// Revert all applied migrations with a version greater than this (0 = revert everything)
@@ -157,23 +159,23 @@ pub enum MigrateCmd {
         #[command(flatten)]
         source: SourceArg,
         #[command(flatten)]
-        url: DatabaseUrlArg,
+        url: ConnectionArgs,
     },
 }
 
 #[derive(Subcommand)]
 pub enum DatabaseCmd {
-    /// Create the database named in the connection URL
+    /// Create the database selected by --database
     Create {
         #[command(flatten)]
-        url: DatabaseUrlArg,
+        url: ConnectionArgs,
         #[command(flatten)]
         definition: DatabaseCreateArgs,
     },
-    /// Drop the database named in the connection URL
+    /// Drop the database selected by --database
     Drop {
         #[command(flatten)]
-        url: DatabaseUrlArg,
+        url: ConnectionArgs,
         #[command(flatten)]
         force: ForceArg,
         /// Drop the database ON CLUSTER with this cluster name
@@ -188,14 +190,14 @@ pub enum DatabaseCmd {
         #[command(flatten)]
         source: SourceArg,
         #[command(flatten)]
-        url: DatabaseUrlArg,
+        url: ConnectionArgs,
         #[command(flatten)]
         definition: DatabaseCreateArgs,
     },
     /// Drop and re-create the database; initialize the manifest separately before migrating
     Reset {
         #[command(flatten)]
-        url: DatabaseUrlArg,
+        url: ConnectionArgs,
         #[command(flatten)]
         force: ForceArg,
         #[command(flatten)]
@@ -211,7 +213,26 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
 
+    fn parse<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Cli, clap::Error> {
+        let mut args: Vec<_> = args.into_iter().collect();
+        if args.get(2) != Some(&"add") {
+            args.extend(["--database", "test"]);
+        }
+        Cli::try_parse_from(args)
+    }
+
     const MANIFEST_COMMANDS: [[&str; 2]; 1] = [["migrate", "init"]];
+
+    #[test]
+    fn database_flag_and_alias_preserve_the_selected_name() {
+        for flag in ["--database", "--db"] {
+            let cli = Cli::try_parse_from(["nomad", "migrate", "run", flag, "my app"]).unwrap();
+            let Command::Migrate(MigrateCmd::Run { url, .. }) = cli.command else {
+                unreachable!();
+            };
+            assert_eq!(url.database.unwrap().as_str(), "my app");
+        }
+    }
 
     #[test]
     fn ask_is_available_for_connection_commands_and_conflicts_with_url() {
@@ -225,20 +246,20 @@ mod tests {
             ("database", "setup"),
             ("database", "reset"),
         ] {
-            assert!(Cli::try_parse_from(["nomad", category, command, "--ask"]).is_ok());
-            let error = Cli::try_parse_from([
+            assert!(parse(["nomad", category, command, "--ask"]).is_ok());
+            let error = parse([
                 "nomad",
                 category,
                 command,
                 "--ask",
-                "--database-url",
+                "--url",
                 "http://localhost",
             ])
             .err()
             .unwrap();
             assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
         }
-        let error = Cli::try_parse_from(["nomad", "migrate", "add", "events", "--ask"])
+        let error = parse(["nomad", "migrate", "add", "events", "--ask"])
             .err()
             .unwrap();
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
@@ -251,14 +272,14 @@ mod tests {
             vec!["nomad", "database", "drop", "--force"],
             vec!["nomad", "database", "reset", "--force"],
         ] {
-            assert!(Cli::try_parse_from(args).is_ok());
+            assert!(parse(args).is_ok());
         }
         for args in [
             vec!["nomad", "migrate", "run", "--force"],
             vec!["nomad", "database", "create", "--force"],
             vec!["nomad", "database", "setup", "--force"],
         ] {
-            assert!(Cli::try_parse_from(args).is_err());
+            assert!(parse(args).is_err());
         }
     }
 
@@ -274,7 +295,7 @@ mod tests {
                     if cluster {
                         args.push("--cluster=production");
                     }
-                    let definition = match Cli::try_parse_from(args).unwrap().command {
+                    let definition = match parse(args).unwrap().command {
                         Command::Database(
                             DatabaseCmd::Create { definition, .. }
                             | DatabaseCmd::Setup { definition, .. }
@@ -293,10 +314,10 @@ mod tests {
                     assert_eq!(definition.cluster.is_some(), cluster);
                 }
             }
-            assert!(Cli::try_parse_from(["nomad", "database", command, "--cluster="]).is_err());
+            assert!(parse(["nomad", "database", command, "--cluster="]).is_err());
         }
-        assert!(Cli::try_parse_from(["nomad", "database", "drop", "--cluster=production"]).is_ok());
-        assert!(Cli::try_parse_from(["nomad", "database", "drop", "--replicated"]).is_err());
+        assert!(parse(["nomad", "database", "drop", "--cluster=production"]).is_ok());
+        assert!(parse(["nomad", "database", "drop", "--replicated"]).is_err());
     }
 
     #[test]
@@ -311,7 +332,7 @@ mod tests {
                 2,
             ),
         ] {
-            assert_eq!(Cli::try_parse_from(args).unwrap().verbose, expected);
+            assert_eq!(parse(args).unwrap().verbose, expected);
         }
     }
 
@@ -327,7 +348,7 @@ mod tests {
                     if cluster.is_some() {
                         args.push("--cluster=production");
                     }
-                    let cli = Cli::try_parse_from(args).unwrap();
+                    let cli = parse(args).unwrap();
                     let Command::Migrate(MigrateCmd::Init { manifest, .. }) = cli.command else {
                         unreachable!();
                     };
@@ -346,7 +367,7 @@ mod tests {
             vec!["nomad", "database", "create"],
             vec!["nomad", "database", "drop"],
         ] {
-            assert!(Cli::try_parse_from(args).is_ok());
+            assert!(parse(args).is_ok());
         }
     }
 
@@ -357,11 +378,9 @@ mod tests {
             ("migrate", "revert"),
             ("migrate", "info"),
         ] {
-            assert!(Cli::try_parse_from(["nomad", category, command]).is_ok());
+            assert!(parse(["nomad", category, command]).is_ok());
             for flag in ["--replicated", "--cluster=production"] {
-                let error = Cli::try_parse_from(["nomad", category, command, flag])
-                    .err()
-                    .unwrap();
+                let error = parse(["nomad", category, command, flag]).err().unwrap();
                 assert_eq!(error.kind(), ErrorKind::UnknownArgument);
             }
         }
@@ -369,16 +388,15 @@ mod tests {
 
     #[test]
     fn cluster_requires_a_nonempty_name() {
-        let error = Cli::try_parse_from(["nomad", "migrate", "init", "--cluster"])
+        let error = parse(["nomad", "migrate", "init", "--cluster"])
             .err()
             .unwrap();
         assert_eq!(error.kind(), ErrorKind::InvalidValue);
         for command in MANIFEST_COMMANDS {
             for name in ["", "  "] {
-                let error =
-                    Cli::try_parse_from(["nomad", command[0], command[1], "--cluster", name])
-                        .err()
-                        .unwrap();
+                let error = parse(["nomad", command[0], command[1], "--cluster", name])
+                    .err()
+                    .unwrap();
                 assert_eq!(error.kind(), ErrorKind::ValueValidation);
                 assert!(error.to_string().contains("--cluster must not be empty"));
             }

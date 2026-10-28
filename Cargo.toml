@@ -12,7 +12,7 @@ chrono = {
   default-features = false,
   features = ["clock", "serde"]
 }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 clickhouse = { version = "0.15", features = ["chrono", "rustls-tls"] }
 dotenvy = "0.15"
 hex = "0.4"

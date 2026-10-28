@@ -54,10 +54,10 @@ fn cluster_scope(cluster: Option<&ClusterName>) -> String {
 async fn existing_engine(opts: &ConnectOptions) -> Result<Option<String>> {
     client::connect_without_db(opts)
         .query("SELECT engine FROM system.databases WHERE name = ?")
-        .bind(&opts.database)
+        .bind(opts.database.as_str())
         .fetch_optional::<String>()
         .await
-        .with_context(|| format!("failed to inspect database {:?}", opts.database))
+        .with_context(|| format!("failed to inspect database {:?}", opts.database.as_str()))
 }
 
 pub async fn create(opts: &ConnectOptions, definition: &DatabaseDefinition) -> Result<()> {
@@ -65,20 +65,20 @@ pub async fn create(opts: &ConnectOptions, definition: &DatabaseDefinition) -> R
         definition.check_engine(&engine)?;
         tracing::info!(
             "database {:?} already exists with engine {engine}; no DDL submitted",
-            opts.database
+            opts.database.as_str()
         );
         return Ok(());
     }
     let ch = client::connect_without_db(opts);
-    client::execute(&ch, &definition.create_sql(&opts.database))
+    client::execute(&ch, &definition.create_sql(opts.database.as_str()))
         .await
-        .with_context(|| format!("failed to create database {:?}", opts.database))?;
+        .with_context(|| format!("failed to create database {:?}", opts.database.as_str()))?;
     let engine = existing_engine(opts)
         .await?
         .context("created database was not found on the connected node")?;
     tracing::info!(
         "created database {:?} with engine {engine}{}",
-        opts.database,
+        opts.database.as_str(),
         cluster_scope(definition.cluster.as_ref())
     );
     Ok(())
@@ -108,14 +108,14 @@ async fn check_drop_size(
         query = query.bind(cluster.as_str());
     }
     let table = query
-        .bind(&opts.database)
+        .bind(opts.database.as_str())
         .fetch_optional::<String>()
         .await
         .context("failed to check database drop-size protection; no DROP submitted")?;
     if let Some(table) = table {
         bail!(
             "database {:?} contains MergeTree data in table {table:?}; max_table_size_to_drop=1 protection prevents dropping it. Pass --force to disable the limit; no DROP submitted",
-            opts.database
+            opts.database.as_str()
         );
     }
     Ok(())
@@ -132,7 +132,7 @@ pub async fn drop(
     if !yes
         && !confirm(&format!(
             "Are you sure you want to drop the database {:?}{scope}?",
-            opts.database
+            opts.database.as_str()
         ))?
     {
         bail!("aborted");
@@ -142,12 +142,12 @@ pub async fn drop(
         &ch,
         &format!(
             "DROP DATABASE IF EXISTS {}{scope}",
-            client::quote_identifier(&opts.database)
+            client::quote_identifier(opts.database.as_str())
         ),
     )
     .await
-    .with_context(|| format!("failed to drop database {:?}", opts.database))?;
-    tracing::info!("dropped database {:?}{scope}", opts.database);
+    .with_context(|| format!("failed to drop database {:?}", opts.database.as_str()))?;
+    tracing::info!("dropped database {:?}{scope}", opts.database.as_str());
     Ok(())
 }
 

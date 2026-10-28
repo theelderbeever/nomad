@@ -24,73 +24,140 @@ impl ClusterName {
     }
 }
 
+/// An explicitly selected, nonempty database name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseName(String);
+
+impl std::str::FromStr for DatabaseName {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        ensure!(!raw.trim().is_empty(), "--database must not be empty");
+        ensure!(
+            !raw.contains('\0'),
+            "--database must not contain a NUL character"
+        );
+        Ok(Self(raw.to_owned()))
+    }
+}
+
+impl DatabaseName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A nonempty migration directory path; it may be created by `migrate add`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationDirectory(std::path::PathBuf);
+
+impl std::str::FromStr for MigrationDirectory {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        ensure!(!raw.trim().is_empty(), "--source must not be empty");
+        ensure!(
+            !raw.contains('\0'),
+            "--source must not contain a NUL character"
+        );
+        Ok(Self(raw.into()))
+    }
+}
+
+impl MigrationDirectory {
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// A server URL that cannot select a database or carry query settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerUrl {
+    endpoint: Url,
+    user: Option<String>,
+    password: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectOptions {
-    /// scheme + host + port only, e.g. "http://localhost:8123"
-    pub endpoint: String,
+    pub endpoint: Url,
     pub user: Option<String>,
     pub password: Option<String>,
-    pub database: String,
+    pub database: DatabaseName,
 }
 
-/// Resolve the connection URL: --database-url flag > CLICKHOUSE_URL > DATABASE_URL.
-pub fn resolve_url(flag: Option<String>) -> Result<String> {
-    resolve_url_from(
-        flag,
-        std::env::var("CLICKHOUSE_URL").ok(),
-        std::env::var("DATABASE_URL").ok(),
-    )
-}
-
-fn resolve_url_from(
-    flag: Option<String>,
-    clickhouse_url: Option<String>,
-    database_url: Option<String>,
-) -> Result<String> {
-    flag.or(clickhouse_url).or(database_url).context(
-        "no database URL provided; pass --database-url, use --ask, or set CLICKHOUSE_URL or DATABASE_URL",
-    )
-}
-
-pub fn parse_url(raw: &str) -> Result<ConnectOptions> {
-    let url = Url::parse(raw).context("invalid database URL")?;
-
-    let (scheme, default_port) = match url.scheme() {
-        "http" | "clickhouse" => ("http", 8123),
-        "https" | "clickhouses" => ("https", 8443),
-        _ => bail!("unsupported URL scheme (expected http, https, clickhouse, or clickhouses)"),
-    };
-
-    let host = url.host_str().context("database URL has no host")?;
-    let port = url.port().unwrap_or(default_port);
-
-    let user = match url.username() {
-        "" => None,
-        u => Some(percent_decode(u)?),
-    };
-    let password = url.password().map(percent_decode).transpose()?;
-
-    let database = url
-        .path_segments()
-        .and_then(|mut segments| segments.next())
-        .filter(|s| !s.is_empty())
-        .map(percent_decode)
-        .transpose()?
-        .unwrap_or_else(|| "default".to_string());
-
-    for (key, _) in url.query_pairs() {
-        tracing::warn!("ignoring unsupported URL query parameter {key:?}");
+impl ConnectOptions {
+    pub fn new(url: ServerUrl, database: DatabaseName) -> Self {
+        Self {
+            endpoint: url.endpoint,
+            user: url.user,
+            password: url.password,
+            database,
+        }
     }
-
-    Ok(ConnectOptions {
-        endpoint: format!("{scheme}://{host}:{port}"),
-        user,
-        password,
-        database,
-    })
 }
 
-/// The url crate keeps userinfo and path segments percent-encoded; decode them.
+/// Resolve the server URL: --url flag > CLICKHOUSE_URL.
+pub fn resolve_url(flag: Option<ServerUrl>) -> Result<Option<ServerUrl>> {
+    resolve_url_from(flag, std::env::var("CLICKHOUSE_URL").ok())
+}
+
+fn resolve_url_from(flag: Option<ServerUrl>, env: Option<String>) -> Result<Option<ServerUrl>> {
+    if let Some(url) = flag {
+        return Ok(Some(url));
+    }
+    env.map(|raw| raw.parse()).transpose()
+}
+
+impl std::str::FromStr for ServerUrl {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        let url = Url::parse(raw).context("invalid server URL")?;
+        let (scheme, default_port) = match url.scheme() {
+            "http" | "clickhouse" => ("http", 8123),
+            "https" | "clickhouses" => ("https", 8443),
+            _ => bail!("unsupported URL scheme (expected http, https, clickhouse, or clickhouses)"),
+        };
+        let host = url.host_str().context("server URL has no host")?;
+        // Inspect the supplied path too: URL parsing normalizes /db/.. to /.
+        let authority = raw
+            .split_once("://")
+            .context("server URL must include a scheme and host")?
+            .1;
+        let path = authority
+            .find(['/', '?', '#', '\\'])
+            .map(|start| &authority[start..])
+            .unwrap_or("");
+        let path = path.split(['?', '#']).next().unwrap_or("");
+        ensure!(
+            (path.is_empty() || path == "/") && (url.path().is_empty() || url.path() == "/"),
+            "server URL must not contain a path; select the database with --database/--db or CLICKHOUSE_DATABASE"
+        );
+        ensure!(
+            url.query().is_none(),
+            "server URL must not contain query parameters; select the database with --database/--db or CLICKHOUSE_DATABASE"
+        );
+        ensure!(
+            url.fragment().is_none(),
+            "server URL must not contain a fragment"
+        );
+        let port = url.port().unwrap_or(default_port);
+        let user = match url.username() {
+            "" => None,
+            u => Some(percent_decode(u)?),
+        };
+        let password = url.password().map(percent_decode).transpose()?;
+        Ok(Self {
+            endpoint: Url::parse(&format!("{scheme}://{host}:{port}"))
+                .context("could not construct server endpoint")?,
+            user,
+            password,
+        })
+    }
+}
+
+/// The url crate keeps userinfo percent-encoded; decode it.
 fn percent_decode(s: &str) -> Result<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -121,94 +188,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn precedence_flag_wins() {
-        let got = resolve_url_from(Some("a".into()), Some("b".into()), Some("c".into())).unwrap();
-        assert_eq!(got, "a");
-    }
-
-    #[test]
-    fn precedence_clickhouse_url_beats_database_url() {
-        let got = resolve_url_from(None, Some("b".into()), Some("c".into())).unwrap();
-        assert_eq!(got, "b");
-    }
-
-    #[test]
-    fn precedence_database_url_fallback() {
-        let got = resolve_url_from(None, None, Some("c".into())).unwrap();
-        assert_eq!(got, "c");
-    }
-
-    #[test]
-    fn precedence_nothing_errors() {
-        assert!(resolve_url_from(None, None, None).is_err());
-    }
-
-    #[test]
-    fn parses_http_with_default_port() {
-        let opts = parse_url("http://localhost/mydb").unwrap();
-        assert_eq!(opts.endpoint, "http://localhost:8123");
-        assert_eq!(opts.database, "mydb");
-        assert_eq!(opts.user, None);
-        assert_eq!(opts.password, None);
-    }
-
-    #[test]
-    fn parses_https_default_port() {
-        let opts = parse_url("https://ch.example.com/prod").unwrap();
-        assert_eq!(opts.endpoint, "https://ch.example.com:8443");
-    }
-
-    #[test]
-    fn maps_clickhouse_scheme_to_http() {
-        let opts = parse_url("clickhouse://localhost/mydb").unwrap();
-        assert_eq!(opts.endpoint, "http://localhost:8123");
-    }
-
-    #[test]
-    fn maps_clickhouses_scheme_to_https() {
-        let opts = parse_url("clickhouses://ch.example.com:9443/mydb").unwrap();
-        assert_eq!(opts.endpoint, "https://ch.example.com:9443");
-    }
-
-    #[test]
-    fn explicit_port_wins() {
-        let opts = parse_url("http://localhost:9999/mydb").unwrap();
-        assert_eq!(opts.endpoint, "http://localhost:9999");
-    }
-
-    #[test]
-    fn empty_path_means_default_database() {
+    fn url_precedence_and_missing_url() {
+        let flag = "http://flag";
+        let env = "http://env";
         assert_eq!(
-            parse_url("http://localhost:8123").unwrap().database,
-            "default"
+            resolve_url_from(Some(flag.parse().unwrap()), Some(env.into())).unwrap(),
+            Some(flag.parse().unwrap())
         );
         assert_eq!(
-            parse_url("http://localhost:8123/").unwrap().database,
-            "default"
+            resolve_url_from(None, Some(env.into())).unwrap(),
+            Some(env.parse().unwrap())
         );
+        assert_eq!(resolve_url_from(None, None).unwrap(), None);
+        assert!(resolve_url_from(None, Some("invalid".into())).is_err());
+    }
+
+    #[test]
+    fn parses_base_urls() {
+        for (raw, endpoint) in [
+            ("http://localhost", "http://localhost:8123/"),
+            ("http://localhost/", "http://localhost:8123/"),
+            ("https://ch.example.com", "https://ch.example.com:8443/"),
+            ("clickhouse://localhost", "http://localhost:8123/"),
+            (
+                "clickhouses://ch.example.com:9443",
+                "https://ch.example.com:9443/",
+            ),
+            ("http://localhost:9999", "http://localhost:9999/"),
+            ("http://[::1]:8123/", "http://[::1]:8123/"),
+        ] {
+            assert_eq!(
+                raw.parse::<ServerUrl>().unwrap().endpoint.as_str(),
+                endpoint
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_paths_and_url_settings() {
+        for raw in [
+            "http://localhost/mydb",
+            "http://localhost/mydb/extra",
+            "http://localhost/mydb/..",
+            "http://localhost/%2e",
+            "http://localhost/./",
+            "http://localhost\\mydb",
+            "http://localhost/%6dydb",
+            "http://localhost//",
+            "clickhouse://localhost/mydb",
+            "https://localhost/mydb",
+            "http://localhost?database=mydb",
+            "http://localhost?",
+            "http://localhost/#mydb",
+            "http://localhost/#",
+            "postgres://localhost",
+            "http://",
+            "localhost",
+        ] {
+            assert!(raw.parse::<ServerUrl>().is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn database_names_are_explicit_and_preserved() {
+        for raw in ["", "  ", "db\0name"] {
+            assert!(raw.parse::<DatabaseName>().is_err());
+        }
+        for raw in ["default", "my app", "db`name", "percent%20name"] {
+            assert_eq!(raw.parse::<DatabaseName>().unwrap().as_str(), raw);
+        }
     }
 
     #[test]
     fn decodes_userinfo() {
-        let opts = parse_url("http://user%40corp:p%40ss@localhost/mydb").unwrap();
+        let opts = "http://user%40corp:p%40ss@localhost"
+            .parse::<ServerUrl>()
+            .unwrap();
         assert_eq!(opts.user.as_deref(), Some("user@corp"));
         assert_eq!(opts.password.as_deref(), Some("p@ss"));
     }
 
     #[test]
-    fn rejects_unknown_scheme() {
-        assert!(parse_url("postgres://localhost/mydb").is_err());
-    }
-
-    #[test]
     fn parsing_errors_do_not_disclose_credentials() {
         for raw in [
-            "http://user:secret@localhost:invalid/mydb",
-            "secret://localhost/mydb",
-            "http://user:secret%ZZ@localhost/mydb",
-            "http://user:secret%FF@localhost/mydb",
+            "http://user:secret@localhost:invalid",
+            "secret://localhost",
+            "http://user:secret%ZZ@localhost",
+            "http://user:secret%FF@localhost",
+            "http://user:secret@localhost/mydb",
         ] {
-            let error = format!("{:#}", parse_url(raw).unwrap_err());
+            let error = format!("{:#}", raw.parse::<ServerUrl>().unwrap_err());
             assert!(!error.contains("secret"), "{error}");
             assert!(!error.contains(raw), "{error}");
         }

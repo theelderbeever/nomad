@@ -32,7 +32,7 @@ macro_rules! require_server {
 }
 
 struct TestEnv {
-    database_url: String,
+    server_url: String,
     db: String,
     source: PathBuf,
     cleanup_cluster: Option<String>,
@@ -45,7 +45,7 @@ impl TestEnv {
         let _ = fs::remove_dir_all(&source);
         fs::create_dir_all(&source).unwrap();
         Self {
-            database_url: format!("{base_url}/{db}"),
+            server_url: base_url.to_owned(),
             db,
             source,
             cleanup_cluster: None,
@@ -60,10 +60,13 @@ impl TestEnv {
     fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_nomad"))
             .args(args)
-            .arg("--database-url")
-            .arg(&self.database_url)
+            .arg("--url")
+            .arg(&self.server_url)
+            .arg("--database")
+            .arg(&self.db)
             .env_remove("CLICKHOUSE_URL")
             .env_remove("DATABASE_URL")
+            .env_remove("CLICKHOUSE_DATABASE")
             .env_remove("RUST_LOG")
             .output()
             .expect("failed to spawn nomad binary")
@@ -80,10 +83,13 @@ impl TestEnv {
         full.push(&source);
         Command::new(env!("CARGO_BIN_EXE_nomad"))
             .args(&full)
-            .arg("--database-url")
-            .arg(&self.database_url)
+            .arg("--url")
+            .arg(&self.server_url)
+            .arg("--database")
+            .arg(&self.db)
             .env_remove("CLICKHOUSE_URL")
             .env_remove("DATABASE_URL")
+            .env_remove("CLICKHOUSE_DATABASE")
             .env("RUST_LOG", log)
             .output()
             .expect("failed to spawn nomad binary")
@@ -526,7 +532,11 @@ async fn incompatible_database_engine_is_rejected_before_reset() {
         vec!["database", "setup", "--replicated"],
         vec!["database", "reset", "--replicated", "-y"],
     ] {
-        let out = env.run(&args);
+        let out = if args[1] == "setup" {
+            env.run_source(&args)
+        } else {
+            env.run(&args)
+        };
         assert!(!out.status.success());
         assert!(
             stderr(&out).contains("incompatible with requested Replicated"),
@@ -668,4 +678,142 @@ async fn destructive_commands_require_force_for_merge_tree_data() {
     assert_ok(&env.run(&["migrate", "init"]));
     assert_ok(&env.run_source(&["migrate", "run"]));
     assert_ok(&env.run(&["database", "drop", "-y", "--force"]));
+}
+
+/// These CLI checks run without a ClickHouse server or a local .env file.
+fn isolated_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nomad"));
+    command
+        .current_dir(std::env::temp_dir())
+        .env_remove("CLICKHOUSE_URL")
+        .env_remove("CLICKHOUSE_DATABASE")
+        .env_remove("DATABASE_URL")
+        .env_remove("RUST_LOG");
+    command
+}
+
+#[test]
+fn missing_connection_values_prompt_for_every_connection_command() {
+    for (category, action) in [
+        ("migrate", "init"),
+        ("migrate", "run"),
+        ("migrate", "revert"),
+        ("migrate", "info"),
+        ("database", "create"),
+        ("database", "drop"),
+        ("database", "setup"),
+        ("database", "reset"),
+    ] {
+        for url_args in [vec!["--url", "http://localhost"], vec!["--ask"]] {
+            let output = isolated_command()
+                .args([category, action])
+                .args(&url_args)
+                .output()
+                .unwrap();
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success());
+            let prompt = if url_args.first() == Some(&"--ask") {
+                "could not read server URL from masked prompt"
+            } else {
+                "could not read database name from prompt"
+            };
+            assert!(error.contains(prompt), "{error}");
+        }
+    }
+    let output = isolated_command()
+        .args(["migrate", "run", "--db", "explicit"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        error.contains("could not read server URL from masked prompt"),
+        "{error}"
+    );
+    let output = isolated_command()
+        .args(["migrate", "add", "--help"])
+        .output()
+        .unwrap();
+    assert_ok(&output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("--database"));
+}
+
+#[test]
+fn database_flags_override_environment_and_url_paths_are_rejected() {
+    for flag in ["--database", "--db"] {
+        let output = isolated_command()
+            .env("CLICKHOUSE_DATABASE", "")
+            .env("CLICKHOUSE_URL", "invalid")
+            .args([
+                "migrate",
+                "run",
+                flag,
+                "explicit",
+                "--url",
+                "http://localhost/mydb",
+            ])
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(error.contains("must not contain a path"), "{error}");
+        assert!(error.contains("--database/--db"), "{error}");
+    }
+    let output = isolated_command()
+        .env("CLICKHOUSE_DATABASE", "from_env")
+        .env("CLICKHOUSE_URL", "http://localhost/mydb")
+        .args(["database", "create"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(error.contains("must not contain a path"), "{error}");
+
+    let output = isolated_command()
+        .env("CLICKHOUSE_DATABASE", "from_env")
+        .args(["database", "drop", "--db", "", "--url", "http://localhost"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--database must not be empty"));
+}
+
+#[test]
+fn missing_source_prompts_before_any_database_operations() {
+    for args in [
+        vec!["migrate", "add", "events"],
+        vec![
+            "migrate",
+            "run",
+            "--url",
+            "http://127.0.0.1:1",
+            "--db",
+            "test",
+        ],
+        vec![
+            "migrate",
+            "revert",
+            "--url",
+            "http://127.0.0.1:1",
+            "--db",
+            "test",
+        ],
+        vec![
+            "migrate",
+            "info",
+            "--url",
+            "http://127.0.0.1:1",
+            "--db",
+            "test",
+        ],
+        vec!["db", "setup", "--url", "http://127.0.0.1:1", "--db", "test"],
+    ] {
+        let output = isolated_command().args(args).output().unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(
+            error.contains("could not read migration directory from prompt; pass --source"),
+            "{error}"
+        );
+    }
 }

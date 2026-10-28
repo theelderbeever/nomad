@@ -31,7 +31,7 @@ impl DropPolicy {
 /// Client scoped to the target database, for running migrations.
 pub fn connect(opts: &ConnectOptions) -> Client {
     base_client(opts)
-        .with_database(&opts.database)
+        .with_database(opts.database.as_str())
         // Surface mid-stream failures on long statements as real errors
         // instead of an HTTP 200 that dies partway through.
         .with_setting("wait_end_of_query", "1")
@@ -44,7 +44,7 @@ pub fn connect_without_db(opts: &ConnectOptions) -> Client {
 }
 
 fn base_client(opts: &ConnectOptions) -> Client {
-    let mut client = Client::default().with_url(&opts.endpoint);
+    let mut client = Client::default().with_url(opts.endpoint.as_str());
     if let Some(user) = &opts.user {
         client = client.with_user(user);
     }

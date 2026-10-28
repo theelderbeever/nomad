@@ -3,36 +3,52 @@ mod client;
 mod config;
 mod db;
 mod migrate;
+mod prompt;
 
-use std::{io::IsTerminal, path::Path};
+use std::io::IsTerminal;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use inquire::{Password, PasswordDisplayMode};
+use inquire::{Password, PasswordDisplayMode, Text};
 
-use cli::{Cli, Command, DatabaseCmd, DatabaseUrlArg, MigrateCmd};
+use cli::{Cli, Command, ConnectionArgs, DatabaseCmd, MigrateCmd};
 use config::ConnectOptions;
 
-fn connect_options(url: DatabaseUrlArg) -> Result<ConnectOptions> {
-    connect_options_with(url, || {
-        Password::new("Database URL:")
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .without_confirmation()
-            .prompt()
-            .context("could not read database URL from masked prompt")
-    })
+fn connect_options(mut connection: ConnectionArgs) -> Result<ConnectOptions> {
+    if !connection.ask {
+        connection.url = config::resolve_url(connection.url)?;
+    }
+    connect_options_with(
+        connection,
+        || {
+            Password::new("Server URL:")
+                .with_display_mode(PasswordDisplayMode::Masked)
+                .without_confirmation()
+                .prompt()
+                .context("could not read server URL from masked prompt; pass --url or set CLICKHOUSE_URL")
+        },
+        || {
+            Text::new("Database name:")
+                .prompt()
+                .context("could not read database name from prompt; pass --database/--db or set CLICKHOUSE_DATABASE")
+        },
+    )
 }
 
 fn connect_options_with(
-    url: DatabaseUrlArg,
-    prompt: impl FnOnce() -> Result<String>,
+    connection: ConnectionArgs,
+    prompt_url: impl FnOnce() -> Result<String>,
+    prompt_database: impl FnOnce() -> Result<String>,
 ) -> Result<ConnectOptions> {
-    let raw = if url.ask {
-        prompt()?
-    } else {
-        config::resolve_url(url.database_url)?
+    let server = match connection.url.filter(|_| !connection.ask) {
+        Some(url) => url,
+        None => prompt_url()?.parse()?,
     };
-    config::parse_url(&raw)
+    let database = match connection.database {
+        Some(database) => database,
+        None => prompt_database()?.parse()?,
+    };
+    Ok(ConnectOptions::new(server, database))
 }
 
 fn with_verbosity(
@@ -83,8 +99,8 @@ async fn run(cli: Cli) -> Result<()> {
                 description,
                 source,
             } => {
-                let (up, down) =
-                    migrate::source::add_migration(Path::new(&source.source), &description)?;
+                let source = prompt::source_directory(source.source)?;
+                let (up, down) = migrate::source::add_migration(source.as_path(), &description)?;
                 tracing::info!("created {}", up.display());
                 tracing::info!("created {}", down.display());
                 Ok(())
@@ -102,8 +118,9 @@ async fn run(cli: Cli) -> Result<()> {
                 dry_run,
             } => {
                 let opts = connect_options(url)?;
+                let source = prompt::source_directory(source.source)?;
                 let ch = client::connect(&opts);
-                migrate::runner::run(&ch, Path::new(&source.source), target_version, dry_run).await
+                migrate::runner::run(&ch, source.as_path(), target_version, dry_run).await
             }
             MigrateCmd::Revert {
                 source,
@@ -113,14 +130,15 @@ async fn run(cli: Cli) -> Result<()> {
                 dry_run,
             } => {
                 let opts = connect_options(url)?;
+                let source = prompt::source_directory(source.source)?;
                 let ch = force.policy().client(client::connect(&opts));
-                migrate::runner::revert(&ch, Path::new(&source.source), target_version, dry_run)
-                    .await
+                migrate::runner::revert(&ch, source.as_path(), target_version, dry_run).await
             }
             MigrateCmd::Info { source, url } => {
                 let opts = connect_options(url)?;
+                let source = prompt::source_directory(source.source)?;
                 let ch = client::connect(&opts);
-                migrate::runner::info(&ch, Path::new(&source.source)).await
+                migrate::runner::info(&ch, source.as_path()).await
             }
         },
         Command::Database(cmd) => match cmd {
@@ -147,9 +165,10 @@ async fn run(cli: Cli) -> Result<()> {
                 definition,
             } => {
                 let opts = connect_options(url)?;
+                let source = prompt::source_directory(source.source)?;
                 db::create(&opts, &definition.definition()).await?;
                 let ch = client::connect(&opts);
-                migrate::runner::run(&ch, Path::new(&source.source), None, false).await
+                migrate::runner::run(&ch, source.as_path(), None, false).await
             }
             DatabaseCmd::Reset {
                 url,
@@ -176,28 +195,32 @@ mod tests {
     #[test]
     fn ask_uses_prompted_url_and_parses_it() {
         let opts = connect_options_with(
-            DatabaseUrlArg {
-                database_url: None,
+            ConnectionArgs {
+                url: None,
+                database: Some("prompted".parse().unwrap()),
                 ask: true,
             },
-            || Ok("http://user:secret@localhost/prompted".into()),
+            || Ok("http://user:secret@localhost".into()),
+            || panic!("unexpected database prompt"),
         )
         .unwrap();
-        assert_eq!(opts.database, "prompted");
+        assert_eq!(opts.database.as_str(), "prompted");
         assert_eq!(opts.password.as_deref(), Some("secret"));
     }
 
     #[test]
     fn explicit_url_does_not_prompt() {
         let opts = connect_options_with(
-            DatabaseUrlArg {
-                database_url: Some("http://localhost/explicit".into()),
+            ConnectionArgs {
+                url: Some("http://localhost".parse().unwrap()),
+                database: Some("explicit".parse().unwrap()),
                 ask: false,
             },
             || panic!("unexpected prompt"),
+            || panic!("unexpected database prompt"),
         )
         .unwrap();
-        assert_eq!(opts.database, "explicit");
+        assert_eq!(opts.database.as_str(), "explicit");
     }
 
     #[test]
@@ -205,24 +228,77 @@ mod tests {
         for input in ["", "invalid"] {
             assert!(
                 connect_options_with(
-                    DatabaseUrlArg {
-                        database_url: None,
+                    ConnectionArgs {
+                        url: None,
+                        database: Some("prompted".parse().unwrap()),
                         ask: true
                     },
                     || Ok(input.into()),
+                    || panic!("unexpected database prompt"),
                 )
                 .is_err()
             );
         }
         let error = connect_options_with(
-            DatabaseUrlArg {
-                database_url: None,
+            ConnectionArgs {
+                url: None,
+                database: Some("prompted".parse().unwrap()),
                 ask: true,
             },
             || anyhow::bail!("prompt canceled"),
+            || panic!("unexpected database prompt"),
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "prompt canceled");
+    }
+
+    #[test]
+    fn missing_values_prompt_automatically() {
+        for ask in [false, true] {
+            let opts = connect_options_with(
+                ConnectionArgs {
+                    url: None,
+                    database: None,
+                    ask,
+                },
+                || Ok("https://localhost".into()),
+                || Ok("chosen".into()),
+            )
+            .unwrap();
+            assert_eq!(opts.endpoint.as_str(), "https://localhost:8443/");
+            assert_eq!(opts.database.as_str(), "chosen");
+        }
+    }
+
+    #[test]
+    fn only_missing_database_prompts_and_invalid_input_fails() {
+        for name in ["chosen", "", "  ", "db\0name"] {
+            let result = connect_options_with(
+                ConnectionArgs {
+                    url: Some("http://localhost".parse().unwrap()),
+                    database: None,
+                    ask: false,
+                },
+                || panic!("unexpected URL prompt"),
+                || Ok(name.into()),
+            );
+            if name == "chosen" {
+                assert_eq!(result.unwrap().database.as_str(), name);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let error = connect_options_with(
+            ConnectionArgs {
+                url: Some("http://localhost".parse().unwrap()),
+                database: None,
+                ask: false,
+            },
+            || panic!("unexpected URL prompt"),
+            || anyhow::bail!("database prompt canceled"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "database prompt canceled");
     }
 
     #[test]
