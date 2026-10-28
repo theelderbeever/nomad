@@ -33,6 +33,8 @@ Common flags:
 
 - `--engine <replicated|atomic>` — select the database engine on `database create`,
   `setup`, and `reset`; omit it to use the server default
+- `--uuid <UUID>` — pin database identity for `database create`, `setup`, and `reset`;
+  accepts a non-nil UUID. When creation is needed and this is omitted, Nomad prompts.
 - `--cluster <NAME>` — scope database create/setup/reset/drop or manifest creation
   to `ON CLUSTER`; `migrate init` warns and ignores it for Replicated/Shared databases
 - `-v`, `-vv`, `-vvv` / `--verbose` — increase Nomad logging (`debug`, then `trace`;
@@ -40,7 +42,7 @@ Common flags:
 - `--source <DIR>` — migration directory; prompts in plain text if omitted, with
   Tab completion for directories and `migrations` as the suggested default.
 - `-U` / `--url <URL>` — server URL; falls back to `NOMAD_CLICKHOUSE_URL`
-  and prompts with masked input if missing
+  and prompts if missing; URL input is visible while typing and masked after submission
 - `-d` / `--database <NAME>` / `--db <NAME>` — prompts in plain text if missing from flags
   and the selected recipe. There is no implicit `default` database.
 - `-H` / `--host <HOST>` — override the URL host; accepts a hostname, IPv4, or IPv6 address.
@@ -51,7 +53,8 @@ Common flags:
   an empty password clears an inherited password
 - `-i` / `--prompt[=<FIELDS>]` — prompt for comma-separated fields: `url`, `host`, `port`,
   `user`, `password`, or `database`. Bare `--prompt` or `-i` means `--prompt=url`; `pass` is an alias for `password`.
-  URL and password input is masked; selected fields replace inherited or explicit values.
+  URL input is visible while typing and masked after submission. Password input stays
+  masked throughout; selected fields replace inherited or explicit values.
 - `--target-version <V>` — run up to / revert down to a version
 - `--dry-run` — preview migration actions without executing them (SQL at debug)
 - `--force` — disable the drop-size limit on `migrate revert`, `database drop`, and
@@ -138,7 +141,7 @@ $ nomad migrate info --host=localhost --db=reporting --prompt
 
 Boolean flags accept an explicit `=false`, such as `--force=false` or `--dry-run=false`,
 to override an inherited `true`. Recipes support `url`, `host`, `port`, `user`,
-`password`, `database`, `source`, `engine`, `cluster`, `prompt`, `force`, `yes`,
+`password`, `database`, `source`, `engine`, `uuid`, `cluster`, `prompt`, `force`, `yes`,
 `target_version`, and `dry_run`. `prompt` is a comma-separated string, such as
 `prompt = "user,password"`. Recipe `pass` is an alias for `password`;
 `target-version` and `dry-run` are accepted aliases.
@@ -162,15 +165,17 @@ $ nomad migrate init
 $ nomad migrate run
 ```
 
-This database creation emits:
+If the UUID prompt is left empty, this database creation emits:
 
 ```sql
 CREATE DATABASE IF NOT EXISTS `myapp` ON CLUSTER `production` ENGINE = Replicated;
 ```
 
 Database replication propagates metadata; `migrate init` inspects the database and
-selects a replicated manifest table engine to share migration records. Existing compatible databases produce no
-DDL. An incompatible existing engine is an error; Nomad does not convert engines.
+selects a replicated manifest table engine to share migration records. When every
+selected node already has a compatible database, no DDL is submitted. Missing cluster
+members are provisioned using the selected identity. An incompatible existing engine
+is an error; Nomad does not convert engines.
 
 `database setup` accepts the same creation flags and requires an existing manifest.
 `database reset` checks engine compatibility before dropping anything and uses the
@@ -204,6 +209,63 @@ universal row-count guard for engines such as Memory. Database protection also c
 nonempty `_nomad_migrations` tables, so a populated manifest requires `--force` to
 drop/reset its database. Migration SQL may explicitly override query settings.
 ([ClickHouse drop-size setting](https://clickhouse.com/docs/operations/server-configuration-parameters/settings#max_table_size_to_drop)).
+
+## Database UUIDs and cluster information
+
+A Replicated database whose Keeper path includes `{uuid}` must reuse the same UUID
+when adding nodes or shards to that database group. Pin that identity in a recipe:
+
+```toml
+[reporting]
+database = "reporting"
+engine = "replicated"
+uuid = "314487e9-ca39-4ff1-ae91-e82c9d3f07e3" # use the UUID of your existing database
+cluster = "{cluster}"
+source = "./clickhouse/migrations/reporting"
+```
+
+`--uuid` overrides recipe `uuid`. Existing UUID or engine mismatches are errors before
+creation, including on other selected cluster members. Nomad no longer stops merely
+because the connected node has the database: missing members are provisioned, and
+all selected nodes are verified after DDL completes. Unavailable nodes are not skipped.
+
+When a new database needs creating and no UUID is supplied, Nomad warns and uses an
+interactive UUID prompt. Enter a UUID to pin it, or leave the input empty to let
+ClickHouse generate one. If some selected nodes already have a common UUID, the
+prompt defaults to that UUID and rejects a different or generated identity. An
+already-existing compatible database does not need a prompt.
+
+For noninteractive creation, supply `--uuid` or recipe `uuid`. For a deliberately
+new database group, `--uuid="$(uuidgen)"` supplies a fresh identity explicitly.
+UUIDs generated by ClickHouse are reported after creation; save the resulting UUID
+in your recipe before expanding the group.
+
+```console
+$ nomad db info -r=reporting
+$ nomad db info --db=reporting --cluster=production
+$ nomad db create -r=reporting --uuid=314487e9-ca39-4ff1-ae91-e82c9d3f07e3
+```
+
+`db info` prints configured hosts, native ports, shard and replica numbers, followed
+by each node's engine and UUID. A node without the database is shown as `MISSING`.
+Missing databases, inconsistent engines, or conflicting Replicated database UUIDs
+produce a nonzero exit status after the report. An unreachable node causes an error
+instead of silently producing an incomplete successful report. The command is read-only.
+
+Without `--cluster` or recipe `cluster`, `db info` discovers an existing Replicated
+database's automatically maintained cluster. Otherwise it explicitly reports only
+the connected node. Cluster macros such as `{cluster}` are expanded using the
+connected server's configuration.
+
+`database reset` resolves its requested UUID before dropping anything. Canceling a
+UUID prompt leaves the database intact. Reset uses the supplied recipe/CLI UUID, or
+prompts for a new identity; it does not silently reuse the old UUID. Reusing an
+existing replication group's UUID can restore its schema from surviving replicas,
+so choose a fresh UUID when a reset is intended to create a fresh group.
+
+Database identity coordinates schema metadata. Adding a new shard still requires
+a migration-history policy: database replication does not copy manifest data across
+shards.
 
 ## How it works
 

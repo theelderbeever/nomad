@@ -1,9 +1,9 @@
 use std::{fs, path::MAIN_SEPARATOR};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use inquire::{Autocomplete, CustomUserError, Text, autocompletion::Replacement};
 
-use crate::config::MigrationDirectory;
+use crate::config::{DatabaseUuid, MigrationDirectory};
 
 pub fn source_directory(source: Option<MigrationDirectory>) -> Result<MigrationDirectory> {
     source_directory_with(source, || {
@@ -24,6 +24,53 @@ fn source_directory_with(
         Some(source) => Ok(source),
         None => prompt()?.parse(),
     }
+}
+
+pub fn database_uuid(
+    supplied: Option<DatabaseUuid>,
+    existing: Option<DatabaseUuid>,
+) -> Result<Option<DatabaseUuid>> {
+    if supplied.is_some() {
+        return Ok(supplied);
+    }
+    tracing::warn!(
+        "No --uuid supplied. Leaving the UUID empty lets ClickHouse generate a new database identity. Reuse the existing UUID when adding a node or shard; record generated UUIDs with `nomad db info`."
+    );
+    let default = existing.map(|uuid| uuid.to_string());
+    database_uuid_with(existing, || {
+        let question = if existing.is_some() {
+            "Database UUID (reuse the existing UUID):"
+        } else {
+            "Database UUID (empty = let ClickHouse generate):"
+        };
+        let mut prompt = Text::new(question)
+            .with_help_message("Pass --uuid or set recipe uuid for noninteractive use");
+        if let Some(default) = &default {
+            prompt = prompt.with_default(default);
+        }
+        prompt
+            .prompt()
+            .context("could not read database UUID from prompt; pass --uuid or set recipe uuid")
+    })
+}
+
+fn database_uuid_with(
+    existing: Option<DatabaseUuid>,
+    prompt: impl FnOnce() -> Result<String>,
+) -> Result<Option<DatabaseUuid>> {
+    let input = prompt()?;
+    let selected = if input.trim().is_empty() {
+        None
+    } else {
+        Some(input.parse::<DatabaseUuid>()?)
+    };
+    if let Some(existing) = existing {
+        ensure!(
+            selected == Some(existing),
+            "existing database UUID is {existing}; reuse it when provisioning missing nodes; no DDL submitted"
+        );
+    }
+    Ok(selected)
 }
 
 #[derive(Clone)]
@@ -80,6 +127,33 @@ impl Autocomplete for DirectoryCompleter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uuid_prompt_requires_an_explicit_choice_and_preserves_existing_identity() {
+        let uuid: DatabaseUuid = "314487e9-ca39-4ff1-ae91-e82c9d3f07e3".parse().unwrap();
+        assert_eq!(database_uuid(Some(uuid), None).unwrap(), Some(uuid));
+        assert_eq!(
+            database_uuid_with(None, || Ok(String::new())).unwrap(),
+            None
+        );
+        assert_eq!(
+            database_uuid_with(None, || Ok(uuid.to_string())).unwrap(),
+            Some(uuid)
+        );
+        assert_eq!(
+            database_uuid_with(Some(uuid), || Ok(uuid.to_string())).unwrap(),
+            Some(uuid)
+        );
+        for value in [
+            "",
+            "invalid",
+            "00000000-0000-0000-0000-000000000000",
+            "11111111-1111-4111-8111-111111111111",
+        ] {
+            assert!(database_uuid_with(Some(uuid), || Ok(value.into())).is_err());
+        }
+        assert!(database_uuid_with(None, || anyhow::bail!("canceled")).is_err());
+    }
 
     #[test]
     fn source_uses_flag_or_prompt_and_rejects_empty_paths() {

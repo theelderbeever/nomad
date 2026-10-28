@@ -53,6 +53,8 @@ struct Recipe {
     #[serde(skip_serializing_if = "Option::is_none")]
     engine: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cluster: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<String>,
@@ -354,6 +356,28 @@ mod tests {
             unreachable!()
         };
         assert_eq!(definition.engine, Some(crate::db::DatabaseEngine::Atomic));
+    }
+
+    #[test]
+    fn uuid_recipe_defaults_use_the_same_parser_as_cli_flags() {
+        let directory = fixture(
+            "toml",
+            "[app]\nuuid = '314487e9-ca39-4ff1-ae91-e82c9d3f07e3'\ncluster = 'production'",
+        );
+        let cli =
+            resolve_test(directory.path(), &["nomad", "db", "create", "-r=app"], &[]).unwrap();
+        let Command::Database(DatabaseCmd::Create { definition, .. }) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(
+            definition.uuid.unwrap().to_string(),
+            "314487e9-ca39-4ff1-ae91-e82c9d3f07e3"
+        );
+        let cli = resolve_test(directory.path(), &["nomad", "db", "info", "-r=app"], &[]).unwrap();
+        let Command::Database(DatabaseCmd::Info { cluster, .. }) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(cluster.unwrap().as_str(), "production");
     }
 
     #[test]

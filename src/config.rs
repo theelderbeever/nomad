@@ -47,6 +47,26 @@ impl DatabaseName {
     }
 }
 
+/// An explicit database identity. Nil UUIDs cannot pin a ClickHouse database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseUuid(uuid::Uuid);
+
+impl std::str::FromStr for DatabaseUuid {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        let uuid = raw.parse::<uuid::Uuid>().context("invalid database UUID")?;
+        ensure!(!uuid.is_nil(), "database UUID must not be nil");
+        Ok(Self(uuid))
+    }
+}
+
+impl std::fmt::Display for DatabaseUuid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// A nonempty migration directory path; it may be created by `migrate add`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationDirectory(std::path::PathBuf);

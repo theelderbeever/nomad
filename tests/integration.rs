@@ -36,6 +36,7 @@ struct TestEnv {
     db: String,
     source: PathBuf,
     cleanup_cluster: Option<String>,
+    uuid: String,
 }
 
 impl TestEnv {
@@ -49,6 +50,7 @@ impl TestEnv {
             db,
             source,
             cleanup_cluster: None,
+            uuid: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -58,8 +60,19 @@ impl TestEnv {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_nomad"))
-            .args(args)
+        let uuid = if matches!(args.get(1), Some(&"create" | &"setup" | &"reset"))
+            && !args.iter().any(|arg| arg.starts_with("--uuid"))
+        {
+            Some(self.uuid.as_str())
+        } else {
+            None
+        };
+        let mut command = Command::new(env!("CARGO_BIN_EXE_nomad"));
+        command.args(args);
+        if let Some(uuid) = uuid {
+            command.args(["--uuid", uuid]);
+        }
+        command
             .arg("--url")
             .arg(&self.server_url)
             .arg("--database")
@@ -85,6 +98,11 @@ impl TestEnv {
         let mut full: Vec<&str> = args.to_vec();
         full.push("--source");
         full.push(&source);
+        if matches!(args.get(1), Some(&"create" | &"setup" | &"reset"))
+            && !args.iter().any(|arg| arg.starts_with("--uuid"))
+        {
+            full.extend(["--uuid", self.uuid.as_str()]);
+        }
         Command::new(env!("CARGO_BIN_EXE_nomad"))
             .args(&full)
             .arg("--url")
@@ -481,6 +499,68 @@ async fn incompatible_manifest_engine_is_rejected() {
 }
 
 #[tokio::test]
+async fn database_uuid_info_and_mismatch_protection() {
+    let base = require_server!();
+    let env = TestEnv::new(&base, "uuid_info");
+    assert_ok(&env.run(&["database", "create", "--engine=atomic"]));
+    let out = env.run(&["db", "info"]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains(&env.uuid));
+    assert!(stdout(&out).contains("Atomic"));
+    assert!(stdout(&out).contains("connected node only"));
+    let wrong = format!("--uuid={}", uuid::Uuid::new_v4());
+    let out = env.run(&["db", "create", "--engine=atomic", &wrong]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("incompatible with requested"));
+    let out = isolated_command()
+        .args([
+            "db",
+            "reset",
+            "--url",
+            &base,
+            "--db",
+            &env.db,
+            "--engine=atomic",
+            "-y",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("could not read database UUID"));
+    assert_ok(&env.run(&["db", "info"])); // The UUID prompt failed before DROP.
+}
+
+#[tokio::test]
+async fn cluster_info_reports_missing_nodes_and_create_provisions_them() {
+    let base = require_server!();
+    let Ok(cluster) = std::env::var("NOMAD_TEST_CLUSTER") else {
+        return;
+    };
+    let mut env = TestEnv::new(&base, "uuid_expansion");
+    env.cleanup_cluster = Some(cluster.clone());
+    assert_ok(&env.run(&["db", "create", "--engine=replicated"]));
+    let count = env
+        .client(&base)
+        .query("SELECT count() FROM system.clusters WHERE cluster = ?")
+        .bind(&cluster)
+        .fetch_one::<u64>()
+        .await
+        .unwrap();
+    let out = env.run(&["db", "info", "--cluster", &cluster]);
+    if count > 1 {
+        assert!(!out.status.success());
+        assert!(stdout(&out).contains("MISSING"));
+    } else {
+        assert_ok(&out);
+    }
+    assert_ok(&env.run(&["db", "create", "--engine=replicated", "--cluster", &cluster]));
+    let out = env.run(&["db", "info", "--cluster", &cluster]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out).matches(&env.uuid).count(), count as usize);
+    assert!(!stdout(&out).contains("MISSING"));
+}
+
+#[tokio::test]
 async fn sql_is_only_logged_at_debug() {
     let base = require_server!();
     let env = TestEnv::new(&base, "logging");
@@ -608,6 +688,13 @@ async fn replicated_database_on_cluster() {
             &cluster,
         ]));
         assert_eq!(engine().await.unwrap(), "Replicated");
+        let out = env.run(&["db", "info", "--cluster", &cluster]);
+        assert_ok(&out);
+        assert!(stdout(&out).contains(&env.uuid));
+        assert!(stdout(&out).contains("CONFIGURED HOST"));
+        let out = env.run(&["db", "info"]);
+        assert_ok(&out);
+        assert!(stdout(&out).contains(&format!("Cluster: {}", env.db)));
         let out = env.run(&["database", "reset", "-y", "--force"]);
         assert!(!out.status.success()); // No accidental downgrade to the default engine.
         assert_eq!(engine().await.unwrap(), "Replicated");

@@ -27,7 +27,11 @@ fn connect_options(connection: ConnectionArgs) -> Result<ConnectOptions> {
         };
         let value = if matches!(field, PromptField::Url | PromptField::Password) {
             Password::new(label)
-                .with_display_mode(PasswordDisplayMode::Masked)
+                .with_display_mode(if field == PromptField::Url {
+                    PasswordDisplayMode::Full
+                } else {
+                    PasswordDisplayMode::Masked
+                })
                 .without_confirmation()
                 .prompt()
         } else {
@@ -184,6 +188,9 @@ async fn run() -> Result<()> {
         Command::Database(cmd) => match cmd {
             DatabaseCmd::Create { url, definition } => {
                 db::create(&connect_options(url)?, &definition.definition()).await
+            }
+            DatabaseCmd::Info { url, cluster } => {
+                db::info(&connect_options(url)?, cluster.as_ref()).await
             }
             DatabaseCmd::Drop {
                 url,

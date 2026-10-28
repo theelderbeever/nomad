@@ -1,6 +1,6 @@
 [package]
 name = "nomad"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A thin sqlx-cli style migration tool for ClickHouse"
 license = "MIT"
@@ -28,6 +28,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+uuid = "1"
 
 [dev-dependencies]
 tempfile = "3"
+uuid = { version = "1", features = ["v4"] }

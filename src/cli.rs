@@ -2,7 +2,10 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::{
     client::DropPolicy,
-    config::{ClusterName, DatabaseName, MigrationDirectory, PromptField, ServerHost, ServerUrl},
+    config::{
+        ClusterName, DatabaseName, DatabaseUuid, MigrationDirectory, PromptField, ServerHost,
+        ServerUrl,
+    },
     db::{DatabaseDefinition, DatabaseEngine},
 };
 
@@ -42,7 +45,7 @@ pub struct SourceArg {
 
 #[derive(Args, Default)]
 pub struct ConnectionArgs {
-    /// ClickHouse server URL (or NOMAD_CLICKHOUSE_URL); prompts with masked input if missing
+    /// ClickHouse server URL (or NOMAD_CLICKHOUSE_URL); prompt input is visible until submitted
     #[arg(short = 'U', long)]
     pub url: Option<ServerUrl>,
     /// Database name; prompts in plain text if missing
@@ -60,7 +63,7 @@ pub struct ConnectionArgs {
     /// Override the URL password (or NOMAD_CLICKHOUSE_PASSWORD); an empty value clears it
     #[arg(short = 'p', long, visible_alias = "pass")]
     pub password: Option<String>,
-    /// Prompt for comma-separated fields; bare --prompt selects url (URL/password input is masked)
+    /// Prompt for comma-separated fields; bare --prompt selects url (URL masked after submission; password always masked)
     #[arg(short = 'i', long, value_enum, value_delimiter = ',', num_args = 0..=1, require_equals = true, default_missing_value = "url")]
     pub prompt: Vec<PromptField>,
 }
@@ -87,6 +90,9 @@ pub struct DatabaseCreateArgs {
     /// Database engine; uses the server default when omitted
     #[arg(long, value_enum)]
     pub engine: Option<DatabaseEngine>,
+    /// Database UUID; prompts if omitted when creating a database
+    #[arg(long)]
+    pub uuid: Option<DatabaseUuid>,
     /// Create (and reset) the database ON CLUSTER with this cluster name
     #[arg(long)]
     pub cluster: Option<ClusterName>,
@@ -96,6 +102,7 @@ impl DatabaseCreateArgs {
     pub fn definition(self) -> DatabaseDefinition {
         DatabaseDefinition {
             engine: self.engine,
+            uuid: self.uuid,
             cluster: self.cluster,
         }
     }
@@ -163,6 +170,14 @@ pub enum DatabaseCmd {
         url: ConnectionArgs,
         #[command(flatten)]
         definition: DatabaseCreateArgs,
+    },
+    /// Show database UUIDs and nodes in the selected or discovered replication cluster
+    Info {
+        #[command(flatten)]
+        url: ConnectionArgs,
+        /// Inspect every node of this cluster; inferred for an existing Replicated database if omitted
+        #[arg(long)]
+        cluster: Option<ClusterName>,
     },
     /// Drop the database selected by --database
     Drop {
@@ -270,6 +285,7 @@ mod tests {
             ("migrate", "revert"),
             ("migrate", "info"),
             ("database", "create"),
+            ("database", "info"),
             ("database", "drop"),
             ("database", "setup"),
             ("database", "reset"),
@@ -332,6 +348,29 @@ mod tests {
         ] {
             assert!(parse(args).is_err());
         }
+    }
+
+    #[test]
+    fn database_uuid_is_parsed_before_operations() {
+        for command in ["create", "setup", "reset"] {
+            assert!(
+                parse([
+                    "nomad",
+                    "db",
+                    command,
+                    "--uuid=314487e9-ca39-4ff1-ae91-e82c9d3f07e3"
+                ])
+                .is_ok()
+            );
+            for value in [
+                "--uuid=",
+                "--uuid=invalid",
+                "--uuid=00000000-0000-0000-0000-000000000000",
+            ] {
+                assert!(parse(["nomad", "db", command, value]).is_err());
+            }
+        }
+        assert!(parse(["nomad", "db", "info", "--cluster=production"]).is_ok());
     }
 
     #[test]
