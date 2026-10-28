@@ -87,8 +87,8 @@ impl ManifestTable {
             "Replicated" | "Shared" => {
                 if let Some(cluster) = cluster {
                     tracing::warn!(
+                        "Database uses Engine = {engine}. Skipping `--cluster={cluster}`",
                         cluster = cluster.as_str(),
-                        "ignoring --cluster for {engine} database: the database propagates manifest DDL automatically"
                     );
                 }
                 Ok(if engine == "Replicated" {

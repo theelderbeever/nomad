@@ -605,7 +605,9 @@ async fn replicated_database_on_cluster() {
         assert_eq!(engine().await.unwrap(), "Replicated");
         let out = env.run(&["migrate", "init", "--cluster=nomad_nonexistent_cluster"]);
         assert_ok(&out);
-        assert!(stderr(&out).contains("ignoring --cluster for Replicated database"));
+        assert!(stderr(&out).contains(
+            "Database uses Engine = Replicated. Skipping `--cluster=nomad_nonexistent_cluster`"
+        ));
         let manifest_engine = env.client(&base)
             .query("SELECT engine FROM system.tables WHERE database = currentDatabase() AND name = '_nomad_migrations'")
             .fetch_one::<String>().await.unwrap();
