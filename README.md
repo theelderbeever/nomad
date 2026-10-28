@@ -5,8 +5,8 @@ A thin, sqlx-cli-style migration tool built specifically for ClickHouse.
 - Reversible migrations only: every migration is a `<version>_<description>.up.sql` /
   `.down.sql` pair. Single-file migrations are not supported.
 - Talks to ClickHouse over the HTTP interface (port 8123/8443).
-- Choose a plain or replicated manifest table, with optional `ON CLUSTER` creation,
-  using `nomad migrate init --replicated --cluster <NAME>`.
+- Initialize a manifest with `nomad migrate init`; its table engine is inferred from
+  the database engine, with optional `--cluster` for Atomic databases.
 
 ## Usage
 
@@ -31,10 +31,10 @@ $ nomad database reset -y  --db myapp # drop and re-create; then run migrate ini
 
 Common flags:
 
-- `--replicated` — use `ReplicatedMergeTree()` on `migrate init`, or the `Replicated`
-  database engine on `database create`, `setup`, and `reset`
-- `--cluster <NAME>` — scope manifest creation or database create/setup/reset/drop
-  to `ON CLUSTER`; independent of `--replicated`
+- `--engine <replicated|atomic>` — select the database engine on `database create`,
+  `setup`, and `reset`; omit it to use the server default
+- `--cluster <NAME>` — scope database create/setup/reset/drop or manifest creation
+  to `ON CLUSTER`; `migrate init` warns and ignores it for Replicated/Shared databases
 - `-v`, `-vv`, `-vvv` / `--verbose` — increase Nomad logging (`debug`, then `trace`;
   further repetitions stay at `trace`); accepted before or after subcommands
 - `--source <DIR>` — migration directory; prompts in plain text if omitted, with
@@ -75,7 +75,7 @@ file, unknown recipe, or unknown option is an error.
 [analytics]
 url = "http://localhost:8123"
 database = "analytics"
-replicated = true
+engine = "replicated"
 cluster = '{cluster}'
 source = "./clickhouse/migrations/analytics"
 
@@ -83,7 +83,7 @@ source = "./clickhouse/migrations/analytics"
 name = "reporting"
 url = "http://localhost:8123"
 database = "reporting"
-replicated = true
+engine = "replicated"
 cluster = '{cluster}'
 source = "./clickhouse/migrations/reporting"
 ```
@@ -94,7 +94,7 @@ The equivalent YAML structure is:
 analytics:
   url: http://localhost:8123
   database: analytics
-  replicated: true
+  engine: replicated
   cluster: '{cluster}'
   source: ./clickhouse/migrations/analytics
 ```
@@ -111,10 +111,10 @@ Priority is **recipe < environment < explicit CLI flags**. `NOMAD_CLICKHOUSE_URL
 is the only environment variable for command options; it overrides the recipe URL.
 `.env` files are not loaded. Legacy `CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`, and
 other environment-based command options are ignored. Boolean flags accept an explicit
-`=false`, such as `--replicated=false` or `--dry-run=false`, to override an inherited
+`=false`, such as `--force=false` or `--dry-run=false`, to override an inherited
 `true`.
 
-Recipes support `url`, `database`, `source`, `replicated`, `cluster`, `ask`, `force`,
+Recipes support `url`, `database`, `source`, `engine`, `cluster`, `ask`, `force`,
 `yes`, `target_version`, and `dry_run`. `target-version` and `dry-run` are accepted
 aliases. The optional `name` is a label; the map key selects the recipe. Only options
 supported by the selected command are used, allowing one recipe to be shared across
@@ -126,13 +126,14 @@ manifests automatically: run `migrate init` explicitly before applying migration
 
 ## Database provisioning
 
-Database creation uses the server's default engine unless `--replicated` is supplied.
+Database creation uses the server's default engine when `--engine` is omitted.
+`--engine=atomic` explicitly selects Atomic; `--engine=replicated` selects Replicated.
 The Replicated engine uses configured defaults for its Keeper/ZooKeeper path, shard,
 and replica names; Nomad does not expose custom engine arguments.
 
 ```console
-$ nomad database create --replicated --cluster=production
-$ nomad migrate init --replicated
+$ nomad database create --engine=replicated --cluster=production
+$ nomad migrate init
 $ nomad migrate run
 ```
 
@@ -142,20 +143,20 @@ This database creation emits:
 CREATE DATABASE IF NOT EXISTS `myapp` ON CLUSTER `production` ENGINE = Replicated;
 ```
 
-Database replication propagates metadata; the manifest still needs its own replicated
-table engine to share migration records. Existing compatible databases produce no
+Database replication propagates metadata; `migrate init` inspects the database and
+selects a replicated manifest table engine to share migration records. Existing compatible databases produce no
 DDL. An incompatible existing engine is an error; Nomad does not convert engines.
 
 `database setup` accepts the same creation flags and requires an existing manifest.
 `database reset` checks engine compatibility before dropping anything and uses the
-selected engine and cluster for recreation. Repeat `--replicated` and `--cluster`
+selected engine and cluster for recreation. Repeat `--engine=replicated` and `--cluster`
 when resetting a replicated cluster database; reset never creates the manifest or
 runs migrations. Custom engine parameters are not preserved by reset: provision
 those databases externally.
 
 ```console
-$ nomad database reset --replicated --cluster=production -y
-$ nomad migrate init --replicated
+$ nomad database reset --engine=replicated --cluster=production -y
+$ nomad migrate init
 $ nomad migrate run
 $ nomad database drop --cluster=production -y
 ```
@@ -169,7 +170,7 @@ migration recorded as applied.
 
 ```console
 $ nomad migrate revert --force
-$ nomad database reset --replicated --cluster=production --force -y
+$ nomad database reset --engine=replicated --cluster=production --force -y
 $ nomad database drop --cluster=production --force -y
 ```
 
@@ -188,39 +189,44 @@ and execution time of every applied migration. All variants use `ORDER BY versio
 Create the manifest explicitly with `nomad migrate init` after creating the database.
 `migrate run`, `revert`, and `info` (including dry runs) require an existing manifest
 and fail with an initialization hint if it is missing; they never create it.
-Initialization is idempotent with matching engine flags and preserves existing migration
-history. If a compatible manifest already exists on the connected node, initialization
-submits no DDL, including with `--cluster`; it does not provision missing tables on
-other nodes. Requesting a different engine for an existing manifest is an error.
-Only `migrate init` creates the manifest. `database setup` creates the database if
-needed and applies migrations using an existing manifest; it fails with the same
-initialization hint if the manifest is missing. `database reset` drops and recreates
-the database without applying migrations. After reset, run `migrate init` with the
-desired replication flags, then `migrate run`.
+Initialization inspects `system.databases` to select the manifest engine:
 
-| Flags | Engine | Creation scope |
+| Database engine | Manifest engine | Creation scope |
 | --- | --- | --- |
-| Neither | `MergeTree` | Connected node |
-| `--cluster production` | `MergeTree` | `ON CLUSTER production` |
-| `--replicated` | `ReplicatedMergeTree()` | Connected node / database-managed DDL |
-| `--replicated --cluster production` | `ReplicatedMergeTree()` | `ON CLUSTER production` |
+| Atomic / Ordinary | `MergeTree` | Connected node, or `ON CLUSTER` with `--cluster` |
+| Replicated | `ReplicatedMergeTree()` | Database-managed DDL; `--cluster` is ignored with a warning |
+| Shared | `SharedMergeTree()` | Shared catalog; `--cluster` is ignored with a warning |
+
+Unknown database engines cause an error before any manifest DDL. Initialization is
+idempotent with a compatible existing manifest and preserves migration history. An
+incompatible manifest is an error; Nomad never converts its engine. If the manifest
+already exists on the connected node, initialization submits no DDL, even with
+`--cluster`; it does not provision missing tables on other nodes.
+
+Only `migrate init` creates the manifest. `database setup` creates the database if
+needed and applies migrations using an existing manifest. `database reset` drops
+and recreates the database without initializing the manifest or applying migrations.
+After reset, run `migrate init`, then `migrate run`.
 
 ```console
-$ nomad migrate init --replicated --cluster=production
+$ nomad database create --engine=replicated --cluster=production
+$ nomad migrate init --cluster=production # warns; the Replicated database propagates DDL
 $ nomad migrate run
-$ nomad migrate info
 ```
 
-Replicated variants use the server's `default_replica_path` and `default_replica_name`
-([ClickHouse replication documentation](https://clickhouse.com/docs/reference/engines/table-engines/mergetree-family/replication)).
+Replicated manifests use the server's `default_replica_path` and `default_replica_name`.
 Self-managed deployments need Keeper/ZooKeeper and suitable replica configuration.
-The variant without `ON CLUSTER` is useful where the database or service manages
-DDL propagation; otherwise ensure the manifest exists on each intended replica with
-a shared replication path.
+For Atomic databases, `--cluster` requires the target database on every cluster node.
+Each node's MergeTree manifest remains independent; creating it on a cluster does
+not replicate migration records. Migration SQL is executed as written: Nomad does
+not inject `ON CLUSTER` or alter table/database engines.
 
-These flags control manifest creation only. They do not convert an existing table's
-engine, add `ON CLUSTER` to migration SQL, or change database engines. Database commands accept their own flags.
-For `ON CLUSTER`, the target database must already exist on every cluster node.
+`--replicated` is no longer accepted on database or migration commands. Replace
+recipe `replicated = true` with `engine = "replicated"` for database provisioning;
+manifest replication is inferred from the actual database, independently of recipe
+`engine`. The same recipe `cluster` remains available to database commands and
+`migrate init`.
+
 Manifest reads, inserts, and deletes use the connected node; `MergeTree` manifests
 remain independent on each node, and replicated manifests share data within their
 replication group, not across shards. Run migrations from a consistent endpoint and
@@ -234,7 +240,7 @@ flags; dependency logs keep their existing levels:
 ```console
 $ nomad -v migrate run --dry-run       # debug, including SQL
 $ nomad migrate run --dry-run -vv      # trace
-$ nomad -vvv migrate init --replicated # trace (maximum level)
+$ nomad -vvv migrate init # trace (maximum level)
 ```
 
 `RUST_LOG` remains available for advanced filters. When verbosity flags are supplied,

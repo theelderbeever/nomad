@@ -105,11 +105,10 @@ async fn run() -> Result<()> {
                 tracing::info!("created {}", down.display());
                 Ok(())
             }
-            MigrateCmd::Init { url, manifest } => {
-                let manifest = manifest.table();
+            MigrateCmd::Init { url, cluster } => {
                 let opts = connect_options(url)?;
                 let ch = client::connect(&opts);
-                migrate::manifest::init(&ch, &manifest).await
+                migrate::manifest::init(&ch, cluster.as_ref()).await
             }
             MigrateCmd::Run {
                 source,

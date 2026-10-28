@@ -51,7 +51,7 @@ struct Recipe {
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    replicated: Option<bool>,
+    engine: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cluster: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,15 +219,15 @@ mod tests {
         for (extension, contents) in [
             (
                 "toml",
-                "[\"app.prod\"]\nname = 'label'\nurl = 'http://localhost'\ndatabase = 'app'\nreplicated = true\ncluster = '{cluster}'\nsource = './migrations'",
+                "[\"app.prod\"]\nname = 'label'\nurl = 'http://localhost'\ndatabase = 'app'\nengine = 'replicated'\ncluster = '{cluster}'\nsource = './migrations'",
             ),
             (
                 "yaml",
-                "app.prod:\n  name: label\n  url: http://localhost\n  database: app\n  replicated: true\n  cluster: '{cluster}'\n  source: ./migrations\n",
+                "app.prod:\n  name: label\n  url: http://localhost\n  database: app\n  engine: replicated\n  cluster: '{cluster}'\n  source: ./migrations\n",
             ),
             (
                 "yml",
-                "app.prod:\n  name: label\n  url: http://localhost\n  database: app\n  replicated: true\n  cluster: '{cluster}'\n  source: ./migrations\n",
+                "app.prod:\n  name: label\n  url: http://localhost\n  database: app\n  engine: replicated\n  cluster: '{cluster}'\n  source: ./migrations\n",
             ),
         ] {
             let directory = fixture(extension, contents);
@@ -257,7 +257,10 @@ mod tests {
                             url, definition, ..
                         },
                     ) => {
-                        assert!(definition.replicated);
+                        assert_eq!(
+                            definition.engine,
+                            Some(crate::db::DatabaseEngine::Replicated)
+                        );
                         assert_eq!(definition.cluster.unwrap().as_str(), "{cluster}");
                         url
                     }
@@ -265,9 +268,8 @@ mod tests {
                         assert_eq!(cluster.unwrap().as_str(), "{cluster}");
                         url
                     }
-                    Command::Migrate(MigrateCmd::Init { url, manifest }) => {
-                        assert!(manifest.replicated);
-                        assert_eq!(manifest.cluster.unwrap().as_str(), "{cluster}");
+                    Command::Migrate(MigrateCmd::Init { url, cluster }) => {
+                        assert_eq!(cluster.unwrap().as_str(), "{cluster}");
                         url
                     }
                     Command::Migrate(
@@ -284,6 +286,49 @@ mod tests {
                 assert_eq!(connection.database.unwrap().as_str(), "app");
             }
         }
+    }
+
+    #[test]
+    fn init_retains_recipe_cluster_and_cli_can_override_it() {
+        let directory = fixture(
+            "toml",
+            "[app]\nengine = 'replicated'\ncluster = 'recipe-cluster'",
+        );
+        for (extra, expected) in [
+            (None, "recipe-cluster"),
+            (Some("--cluster=cli-cluster"), "cli-cluster"),
+        ] {
+            let mut args = vec!["nomad", "migrate", "init", "-r=app"];
+            args.extend(extra);
+            let cli = resolve_test(directory.path(), &args, &[]).unwrap();
+            let Command::Migrate(MigrateCmd::Init { cluster, .. }) = cli.command else {
+                unreachable!()
+            };
+            assert_eq!(cluster.unwrap().as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn recipe_engine_uses_the_cli_enum_parser() {
+        let directory = fixture("toml", "[app]\nengine = 'unknown'");
+        assert!(
+            resolve_test(
+                directory.path(),
+                &["nomad", "database", "create", "-r=app"],
+                &[]
+            )
+            .is_err()
+        );
+        let cli = resolve_test(
+            directory.path(),
+            &["nomad", "database", "create", "-r=app", "--engine=atomic"],
+            &[],
+        )
+        .unwrap();
+        let Command::Database(DatabaseCmd::Create { definition, .. }) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(definition.engine, Some(crate::db::DatabaseEngine::Atomic));
     }
 
     #[test]
@@ -312,7 +357,7 @@ mod tests {
     fn precedence_is_recipe_then_environment_then_explicit_flags() {
         let directory = fixture(
             "toml",
-            "[app]\nurl = 'http://recipe'\ndatabase = 'recipe'\nsource = 'recipe'\nreplicated = false\ncluster = 'recipe'",
+            "[app]\nurl = 'http://recipe'\ndatabase = 'recipe'\nsource = 'recipe'\nengine = 'atomic'\ncluster = 'recipe'",
         );
         let env = [("url", "http://environment")];
         let args = ["nomad", "database", "setup", "-r=app"];
@@ -338,7 +383,7 @@ mod tests {
             "--db=cli",
             "--source=cli",
             "--cluster=cli",
-            "--replicated",
+            "--engine=replicated",
         ];
         let cli = resolve_test(directory.path(), &args, &env).unwrap();
         let Command::Database(DatabaseCmd::Setup {
@@ -353,7 +398,10 @@ mod tests {
         assert_eq!(url.url.unwrap(), "http://cli".parse().unwrap());
         assert_eq!(source.source.unwrap().as_path(), Path::new("cli"));
         assert_eq!(definition.cluster.unwrap().as_str(), "cli");
-        assert!(definition.replicated);
+        assert_eq!(
+            definition.engine,
+            Some(crate::db::DatabaseEngine::Replicated)
+        );
     }
 
     #[test]
@@ -444,7 +492,7 @@ mod tests {
     fn explicit_false_overrides_inherited_boolean_values() {
         let directory = fixture(
             "toml",
-            "[app]\nreplicated = true\nask = true\nforce = true\nyes = true\ndry_run = true",
+            "[app]\nengine = 'replicated'\nask = true\nforce = true\nyes = true\ndry_run = true",
         );
         let cli = resolve_test(
             directory.path(),
@@ -453,7 +501,7 @@ mod tests {
                 "database",
                 "reset",
                 "-r=app",
-                "--replicated=false",
+                "--engine=atomic",
                 "--ask=false",
                 "--force=false",
                 "--yes=false",
@@ -470,7 +518,7 @@ mod tests {
         else {
             unreachable!()
         };
-        assert!(!definition.replicated);
+        assert_eq!(definition.engine, Some(crate::db::DatabaseEngine::Atomic));
         assert!(!url.ask);
         assert!(!force.force);
         assert!(!yes);

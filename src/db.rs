@@ -7,22 +7,35 @@ use crate::{
     config::{ClusterName, ConnectOptions},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum DatabaseEngine {
-    Default,
+    Atomic,
     Replicated,
 }
 
+impl DatabaseEngine {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Atomic => "Atomic",
+            Self::Replicated => "Replicated",
+        }
+    }
+}
+
 pub struct DatabaseDefinition {
-    pub engine: DatabaseEngine,
+    pub engine: Option<DatabaseEngine>,
     pub cluster: Option<ClusterName>,
 }
 
 impl DatabaseDefinition {
     fn create_sql(&self, name: &str) -> String {
         let engine = match self.engine {
-            DatabaseEngine::Default => "",
-            DatabaseEngine::Replicated => " ENGINE = Replicated",
+            None => "",
+            Some(DatabaseEngine::Atomic) => " ENGINE = Atomic",
+            Some(DatabaseEngine::Replicated) => " ENGINE = Replicated",
         };
         format!(
             "CREATE DATABASE IF NOT EXISTS {}{}{engine}",
@@ -33,13 +46,16 @@ impl DatabaseDefinition {
 
     fn check_engine(&self, engine: &str) -> Result<()> {
         let compatible = match self.engine {
-            DatabaseEngine::Default => matches!(engine, "Atomic" | "Shared"),
-            DatabaseEngine::Replicated => engine == "Replicated",
+            None => matches!(engine, "Atomic" | "Shared"),
+            Some(DatabaseEngine::Atomic) => engine == "Atomic",
+            Some(DatabaseEngine::Replicated) => engine == "Replicated",
         };
+        let requested = self
+            .engine
+            .map_or("server default (Atomic or Shared)", DatabaseEngine::name);
         anyhow::ensure!(
             compatible,
-            "existing database uses engine {engine}, incompatible with requested {:?}; use --replicated for Replicated databases. Nomad does not convert database engines",
-            self.engine
+            "existing database uses engine {engine}, incompatible with requested {requested}; select the matching --engine. Nomad does not convert database engines"
         );
         Ok(())
     }
@@ -164,7 +180,7 @@ pub async fn reset(
     drop(opts, definition.cluster.as_ref(), yes, policy).await?;
     create(opts, definition).await?;
     tracing::info!(
-        "database reset complete; no migrations applied. Run `nomad migrate init` with the desired replication flags, then `nomad migrate run`"
+        "database reset complete; no migrations applied. Run `nomad migrate init`, then `nomad migrate run`"
     );
     Ok(())
 }
@@ -182,8 +198,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn database_ddl_supports_all_four_combinations() {
-        for engine in [DatabaseEngine::Default, DatabaseEngine::Replicated] {
+    fn database_ddl_supports_explicit_engines_and_server_default() {
+        for engine in [
+            None,
+            Some(DatabaseEngine::Atomic),
+            Some(DatabaseEngine::Replicated),
+        ] {
             for cluster in [None, Some("production".parse().unwrap())] {
                 let definition = DatabaseDefinition { engine, cluster };
                 let scope = if definition.cluster.is_some() {
@@ -191,8 +211,10 @@ mod tests {
                 } else {
                     ""
                 };
-                let suffix = if engine == DatabaseEngine::Replicated {
+                let suffix = if engine == Some(DatabaseEngine::Replicated) {
                     " ENGINE = Replicated"
+                } else if engine == Some(DatabaseEngine::Atomic) {
+                    " ENGINE = Atomic"
                 } else {
                     ""
                 };
@@ -207,13 +229,21 @@ mod tests {
     #[test]
     fn existing_database_engine_must_match_the_request() {
         let default = DatabaseDefinition {
-            engine: DatabaseEngine::Default,
+            engine: None,
             cluster: None,
         };
         let replicated = DatabaseDefinition {
-            engine: DatabaseEngine::Replicated,
+            engine: Some(DatabaseEngine::Replicated),
             cluster: None,
         };
+        let atomic = DatabaseDefinition {
+            engine: Some(DatabaseEngine::Atomic),
+            cluster: None,
+        };
+        assert!(atomic.check_engine("Atomic").is_ok());
+        assert!(atomic.check_engine("Shared").is_err());
+        assert!(atomic.check_engine("Replicated").is_err());
+        assert!(default.check_engine("Shared").is_ok());
         assert!(default.check_engine("Atomic").is_ok());
         assert!(replicated.check_engine("Replicated").is_ok());
         assert!(default.check_engine("Replicated").is_err());
@@ -223,7 +253,7 @@ mod tests {
     #[test]
     fn database_and_cluster_names_are_quoted() {
         let definition = DatabaseDefinition {
-            engine: DatabaseEngine::Replicated,
+            engine: Some(DatabaseEngine::Replicated),
             cluster: Some("prod`\\?".parse().unwrap()),
         };
         let sql = definition.create_sql("db`\\?; DROP DATABASE important; --");

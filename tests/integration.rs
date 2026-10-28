@@ -422,9 +422,6 @@ async fn manifest_must_be_initialized_explicitly() {
     let out = env.run(&["migrate", "init", "--cluster=nomad_nonexistent_cluster"]);
     assert_ok(&out);
     assert!(stderr(&out).contains("no DDL submitted"));
-    let out = env.run(&["migrate", "init", "--replicated"]);
-    assert!(!out.status.success());
-    assert!(stderr(&out).contains("incompatible with requested ReplicatedMergeTree()"));
     assert_eq!(tracking_rows(&client).await.len(), 1);
     let out = env.run(&["database", "reset", "-y", "--force"]);
     assert_ok(&out);
@@ -441,6 +438,38 @@ async fn manifest_must_be_initialized_explicitly() {
     assert_ok(&env.run(&["migrate", "init"]));
     assert_ok(&env.run_source(&["database", "setup"]));
     assert_eq!(tracking_rows(&client).await.len(), 1);
+}
+
+#[tokio::test]
+async fn incompatible_manifest_engine_is_rejected() {
+    let base = require_server!();
+    let env = TestEnv::new(&base, "manifest_engine");
+    assert_ok(&env.run(&["database", "create", "--engine=atomic"]));
+    let client = env.client(&base);
+    let out = env.run(&["migrate", "init", "--cluster=nomad_nonexistent_cluster"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("nomad_nonexistent_cluster"));
+    let count = client.query("SELECT count() FROM system.tables WHERE database = currentDatabase() AND name = '_nomad_migrations'").fetch_one::<u64>().await.unwrap();
+    assert_eq!(count, 0); // Atomic databases honor the requested cluster.
+    client
+        .query("CREATE TABLE _nomad_migrations (id UInt64) ENGINE = Memory")
+        .execute()
+        .await
+        .unwrap();
+    client
+        .query("INSERT INTO _nomad_migrations VALUES (1)")
+        .execute()
+        .await
+        .unwrap();
+    let out = env.run(&["migrate", "init"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("incompatible with inferred MergeTree"));
+    let rows = client
+        .query("SELECT count() FROM _nomad_migrations")
+        .fetch_one::<u64>()
+        .await
+        .unwrap();
+    assert_eq!(rows, 1); // Incompatible tables and their data are preserved.
 }
 
 #[tokio::test]
@@ -528,9 +557,9 @@ async fn incompatible_database_engine_is_rejected_before_reset() {
     assert_ok(&out);
     assert!(stderr(&out).contains("no DDL submitted"));
     for args in [
-        vec!["database", "create", "--replicated"],
-        vec!["database", "setup", "--replicated"],
-        vec!["database", "reset", "--replicated", "-y"],
+        vec!["database", "create", "--engine=replicated"],
+        vec!["database", "setup", "--engine=replicated"],
+        vec!["database", "reset", "--engine=replicated", "-y"],
     ] {
         let out = if args[1] == "setup" {
             env.run_source(&args)
@@ -563,16 +592,28 @@ async fn replicated_database_on_cluster() {
             .fetch_one::<String>()
     };
     let result = async {
-        assert_ok(&env.run(&["database", "create", "--replicated", "--cluster", &cluster]));
+        assert_ok(&env.run(&[
+            "database",
+            "create",
+            "--engine=replicated",
+            "--cluster",
+            &cluster,
+        ]));
         assert_eq!(engine().await.unwrap(), "Replicated");
         let out = env.run(&["database", "reset", "-y", "--force"]);
         assert!(!out.status.success()); // No accidental downgrade to the default engine.
         assert_eq!(engine().await.unwrap(), "Replicated");
-        assert_ok(&env.run(&["migrate", "init", "--replicated"]));
+        let out = env.run(&["migrate", "init", "--cluster=nomad_nonexistent_cluster"]);
+        assert_ok(&out);
+        assert!(stderr(&out).contains("ignoring --cluster for Replicated database"));
+        let manifest_engine = env.client(&base)
+            .query("SELECT engine FROM system.tables WHERE database = currentDatabase() AND name = '_nomad_migrations'")
+            .fetch_one::<String>().await.unwrap();
+        assert_eq!(manifest_engine, "ReplicatedMergeTree");
         assert_ok(&env.run(&[
             "database",
             "reset",
-            "--replicated",
+            "--engine=replicated",
             "--cluster",
             &cluster,
             "-y",
@@ -597,7 +638,7 @@ async fn replicated_database_on_cluster() {
         let out = env.run(&[
             "database",
             "reset",
-            "--replicated",
+            "--engine=replicated",
             "--cluster",
             &cluster,
             "-y",
@@ -614,7 +655,7 @@ async fn replicated_database_on_cluster() {
         assert_ok(&env.run(&[
             "database",
             "reset",
-            "--replicated",
+            "--engine=replicated",
             "--cluster",
             &cluster,
             "-y",

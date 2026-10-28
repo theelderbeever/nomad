@@ -4,7 +4,6 @@ use crate::{
     client::DropPolicy,
     config::{ClusterName, DatabaseName, MigrationDirectory, ServerUrl},
     db::{DatabaseDefinition, DatabaseEngine},
-    migrate::manifest::ManifestTable,
 };
 
 #[derive(Parser)]
@@ -55,25 +54,6 @@ pub struct ConnectionArgs {
 }
 
 #[derive(Args)]
-pub struct ManifestArgs {
-    /// Use ReplicatedMergeTree for the migration manifest table
-    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
-    pub replicated: bool,
-    /// Create the migration manifest table ON CLUSTER with this cluster name
-    #[arg(long)]
-    pub cluster: Option<ClusterName>,
-}
-
-impl ManifestArgs {
-    pub fn table(&self) -> ManifestTable {
-        ManifestTable {
-            replicated: self.replicated,
-            cluster: self.cluster.clone(),
-        }
-    }
-}
-
-#[derive(Args)]
 pub struct ForceArg {
     /// Disable the 1-byte MergeTree drop-size limit (max_table_size_to_drop=0)
     #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
@@ -92,9 +72,9 @@ impl ForceArg {
 
 #[derive(Args)]
 pub struct DatabaseCreateArgs {
-    /// Use the Replicated database engine with server-configured defaults
-    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
-    pub replicated: bool,
+    /// Database engine; uses the server default when omitted
+    #[arg(long, value_enum)]
+    pub engine: Option<DatabaseEngine>,
     /// Create (and reset) the database ON CLUSTER with this cluster name
     #[arg(long)]
     pub cluster: Option<ClusterName>,
@@ -103,11 +83,7 @@ pub struct DatabaseCreateArgs {
 impl DatabaseCreateArgs {
     pub fn definition(self) -> DatabaseDefinition {
         DatabaseDefinition {
-            engine: if self.replicated {
-                DatabaseEngine::Replicated
-            } else {
-                DatabaseEngine::Default
-            },
+            engine: self.engine,
             cluster: self.cluster,
         }
     }
@@ -119,8 +95,9 @@ pub enum MigrateCmd {
     Init {
         #[command(flatten)]
         url: ConnectionArgs,
-        #[command(flatten)]
-        manifest: ManifestArgs,
+        /// Create the manifest ON CLUSTER (ignored with a warning for Replicated databases)
+        #[arg(long)]
+        cluster: Option<ClusterName>,
     },
     /// Create a new pair of <version>_<description>.{up,down}.sql migration files
     Add {
@@ -224,8 +201,6 @@ mod tests {
         Cli::try_parse_from(args)
     }
 
-    const MANIFEST_COMMANDS: [[&str; 2]; 1] = [["migrate", "init"]];
-
     #[test]
     fn database_flag_and_alias_preserve_the_selected_name() {
         for flag in ["--database", "--db"] {
@@ -287,40 +262,38 @@ mod tests {
     }
 
     #[test]
-    fn database_creation_flags_are_independent_of_manifest_flags() {
+    fn database_engine_is_an_explicit_enum() {
         for command in ["create", "setup", "reset"] {
-            for replicated in [false, true] {
-                for cluster in [false, true] {
-                    let mut args = vec!["nomad", "database", command];
-                    if replicated {
-                        args.push("--replicated");
-                    }
-                    if cluster {
-                        args.push("--cluster=production");
-                    }
-                    let definition = match parse(args).unwrap().command {
-                        Command::Database(
-                            DatabaseCmd::Create { definition, .. }
-                            | DatabaseCmd::Setup { definition, .. }
-                            | DatabaseCmd::Reset { definition, .. },
-                        ) => definition.definition(),
-                        _ => unreachable!(),
-                    };
-                    assert_eq!(
-                        definition.engine,
-                        if replicated {
-                            DatabaseEngine::Replicated
-                        } else {
-                            DatabaseEngine::Default
-                        }
-                    );
-                    assert_eq!(definition.cluster.is_some(), cluster);
-                }
+            for (flag, expected) in [
+                (None, None),
+                (Some("--engine=atomic"), Some(DatabaseEngine::Atomic)),
+                (
+                    Some("--engine=replicated"),
+                    Some(DatabaseEngine::Replicated),
+                ),
+            ] {
+                let mut args = vec!["nomad", "database", command, "--cluster=production"];
+                args.extend(flag);
+                let Command::Database(
+                    DatabaseCmd::Create { definition, .. }
+                    | DatabaseCmd::Setup { definition, .. }
+                    | DatabaseCmd::Reset { definition, .. },
+                ) = parse(args).unwrap().command
+                else {
+                    unreachable!()
+                };
+                assert_eq!(definition.definition().engine, expected);
             }
-            assert!(parse(["nomad", "database", command, "--cluster="]).is_err());
+            for invalid in [
+                "--engine=unknown",
+                "--engine=",
+                "--replicated",
+                "--cluster=",
+            ] {
+                assert!(parse(["nomad", "database", command, invalid]).is_err());
+            }
         }
-        assert!(parse(["nomad", "database", "drop", "--cluster=production"]).is_ok());
-        assert!(parse(["nomad", "database", "drop", "--replicated"]).is_err());
+        assert!(parse(["nomad", "database", "drop", "--engine=atomic"]).is_err());
     }
 
     #[test]
@@ -340,30 +313,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_flags_select_all_four_combinations() {
-        for command in MANIFEST_COMMANDS {
-            for replicated in [false, true] {
-                for cluster in [None, Some("production")] {
-                    let mut args = vec!["nomad", command[0], command[1]];
-                    if replicated {
-                        args.push("--replicated");
-                    }
-                    if cluster.is_some() {
-                        args.push("--cluster=production");
-                    }
-                    let cli = parse(args).unwrap();
-                    let Command::Migrate(MigrateCmd::Init { manifest, .. }) = cli.command else {
-                        unreachable!();
-                    };
-                    let manifest = manifest.table();
-                    assert_eq!(manifest.replicated, replicated);
-                    assert_eq!(manifest.cluster.as_ref().map(ClusterName::as_str), cluster);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn commands_without_a_manifest_do_not_require_selection() {
         for args in [
             vec!["nomad", "migrate", "add", "events"],
@@ -377,12 +326,17 @@ mod tests {
     #[test]
     fn migration_commands_only_use_the_existing_manifest() {
         for (category, command) in [
+            ("migrate", "init"),
             ("migrate", "run"),
             ("migrate", "revert"),
             ("migrate", "info"),
         ] {
             assert!(parse(["nomad", category, command]).is_ok());
-            for flag in ["--replicated", "--cluster=production"] {
+            assert_eq!(
+                parse(["nomad", category, command, "--cluster=production"]).is_ok(),
+                command == "init"
+            );
+            for flag in ["--replicated", "--engine=replicated"] {
                 let error = parse(["nomad", category, command, flag]).err().unwrap();
                 assert_eq!(error.kind(), ErrorKind::UnknownArgument);
             }
@@ -391,11 +345,17 @@ mod tests {
 
     #[test]
     fn cluster_requires_a_nonempty_name() {
-        let error = parse(["nomad", "migrate", "init", "--cluster"])
+        let error = parse(["nomad", "database", "create", "--cluster"])
             .err()
             .unwrap();
         assert_eq!(error.kind(), ErrorKind::InvalidValue);
-        for command in MANIFEST_COMMANDS {
+        for command in [
+            ["migrate", "init"],
+            ["database", "create"],
+            ["database", "setup"],
+            ["database", "reset"],
+            ["database", "drop"],
+        ] {
             for name in ["", "  "] {
                 let error = parse(["nomad", command[0], command[1], "--cluster", name])
                     .err()
