@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod migrate;
 mod prompt;
+mod recipe;
 
 use std::io::IsTerminal;
 
@@ -14,10 +15,7 @@ use inquire::{Password, PasswordDisplayMode, Text};
 use cli::{Cli, Command, ConnectionArgs, DatabaseCmd, MigrateCmd};
 use config::ConnectOptions;
 
-fn connect_options(mut connection: ConnectionArgs) -> Result<ConnectOptions> {
-    if !connection.ask {
-        connection.url = config::resolve_url(connection.url)?;
-    }
+fn connect_options(connection: ConnectionArgs) -> Result<ConnectOptions> {
     connect_options_with(
         connection,
         || {
@@ -25,12 +23,12 @@ fn connect_options(mut connection: ConnectionArgs) -> Result<ConnectOptions> {
                 .with_display_mode(PasswordDisplayMode::Masked)
                 .without_confirmation()
                 .prompt()
-                .context("could not read server URL from masked prompt; pass --url or set CLICKHOUSE_URL")
+                .context("could not read server URL from masked prompt; pass --url or set NOMAD_CLICKHOUSE_URL")
         },
         || {
-            Text::new("Database name:")
-                .prompt()
-                .context("could not read database name from prompt; pass --database/--db or set CLICKHOUSE_DATABASE")
+            Text::new("Database name:").prompt().context(
+                "could not read database name from prompt; pass --database/--db or select a recipe",
+            )
         },
     )
 }
@@ -69,9 +67,6 @@ fn with_verbosity(
 
 #[tokio::main]
 async fn main() {
-    // Best-effort .env loading, like sqlx-cli.
-    let _ = dotenvy::dotenv();
-
     let cli = Cli::parse();
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
@@ -86,13 +81,18 @@ async fn main() {
         .with_target(false)
         .init();
 
-    if let Err(err) = run(cli).await {
+    if let Err(err) = run().await {
         tracing::error!("{err:#}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run() -> Result<()> {
+    let cli = recipe::resolve(
+        std::env::args_os(),
+        &std::env::current_dir().context("could not access current directory")?,
+        recipe::environment(),
+    )?;
     match cli.command {
         Command::Migrate(cmd) => match cmd {
             MigrateCmd::Add {

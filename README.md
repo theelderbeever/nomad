@@ -15,17 +15,16 @@ $ nomad migrate add create_events
 created migrations/20260803120000_create_events.up.sql
 created migrations/20260803120000_create_events.down.sql
 
-$ export CLICKHOUSE_URL=http://default:secret@localhost:8123
-$ export CLICKHOUSE_DATABASE=myapp
+$ export NOMAD_CLICKHOUSE_URL=http://default:secret@localhost:8123
 
-$ nomad database create # create the database
-$ nomad migrate init    # create _nomad_migrations (plain MergeTree by default)
-$ nomad database setup  # create database + run pending (manifest must already exist)
-$ nomad migrate run     # apply pending migrations
-$ nomad migrate info    # list applied/pending
-$ nomad migrate revert  # revert the latest applied migration
-$ nomad migrate revert --target-version 0   # revert everything
-$ nomad database reset -y  # drop and re-create; then run migrate init and migrate run
+$ nomad database create --db myapp # create the database
+$ nomad migrate init    --db myapp # create _nomad_migrations (plain MergeTree by default)
+$ nomad database setup  --db myapp # create database + run pending (manifest must already exist)
+$ nomad migrate run     --db myapp # apply pending migrations
+$ nomad migrate info    --db myapp # list applied/pending
+$ nomad migrate revert  --db myapp # revert the latest applied migration
+$ nomad migrate revert --target-version 0   --db myapp # revert everything
+$ nomad database reset -y  --db myapp # drop and re-create; then run migrate init and migrate run
 ```
 
 `database` can also be written as `db`, e.g. `nomad db create --db myapp`.
@@ -40,10 +39,10 @@ Common flags:
   further repetitions stay at `trace`); accepted before or after subcommands
 - `--source <DIR>` — migration directory; prompts in plain text if omitted, with
   Tab completion for directories and `migrations` as the suggested default.
-- `--url <URL>` — server URL; falls back to `CLICKHOUSE_URL`
-  and prompts with masked input if missing (a `.env` file is loaded if present)
-- `--database <NAME>` / `--db <NAME>` — falls back to `CLICKHOUSE_DATABASE`, then
-  prompts in plain text. There is no implicit `default` database.
+- `--url <URL>` — server URL; falls back to `NOMAD_CLICKHOUSE_URL`
+  and prompts with masked input if missing
+- `--database <NAME>` / `--db <NAME>` — prompts in plain text if missing from flags
+  and the selected recipe. There is no implicit `default` database.
 - `--ask` — prompt for the server URL with input masked by asterisks; ignores environment
   URLs and conflicts with `--url`, e.g. `nomad migrate run --ask --db myapp`
 - `--target-version <V>` — run up to / revert down to a version
@@ -55,18 +54,75 @@ Accepted URLs: `http://`, `https://`, `clickhouse://` (→ http, port 8123),
 `clickhouses://` (→ https, port 8443). URLs accept a base server address, optional
 credentials and port, and an optional trailing slash. Paths (including database names), query strings, and fragments are rejected.
 Pass the database separately, e.g. `nomad migrate run --url http://localhost:8123 --db myapp`,
-or set:
-
-```
-CLICKHOUSE_URL=http://default:secret@localhost:8123
-CLICKHOUSE_DATABASE=myapp
-```
+or export `NOMAD_CLICKHOUSE_URL` and pass `--db myapp`.
 
 `--database-url` and the `DATABASE_URL` fallback are no longer supported. CLI flags
-override the corresponding environment variables; `--ask` forces the URL prompt.
+override `NOMAD_CLICKHOUSE_URL`; `--ask` forces the URL prompt.
 Connection commands prompt for any missing URL or database name. For noninteractive
-use, supply both through flags or environment variables, and pass `--source` to commands
+use, supply the URL through a flag, recipe, or `NOMAD_CLICKHOUSE_URL`, supply the
+database through a flag or recipe, and pass `--source` to commands
 that use migrations. `migrate add` only needs the migration directory.
+
+## Recipes
+
+Pass `--recipe <NAME>` / `-r=<NAME>` to any `database` or `migrate` command.
+Nomad reads a map of recipe names from `.nomad-recipes.toml`,
+`.nomad-recipes.yaml`, or `.nomad-recipes.yml` in the current directory. Keep only
+one of these files. Recipes are loaded only when explicitly selected; a missing
+file, unknown recipe, or unknown option is an error.
+
+```toml
+[analytics]
+url = "http://localhost:8123"
+database = "analytics"
+replicated = true
+cluster = '{cluster}'
+source = "./clickhouse/migrations/analytics"
+
+[reporting]
+name = "reporting"
+url = "http://localhost:8123"
+database = "reporting"
+replicated = true
+cluster = '{cluster}'
+source = "./clickhouse/migrations/reporting"
+```
+
+The equivalent YAML structure is:
+
+```yaml
+analytics:
+  url: http://localhost:8123
+  database: analytics
+  replicated: true
+  cluster: '{cluster}'
+  source: ./clickhouse/migrations/analytics
+```
+
+```console
+$ nomad database create -r=analytics
+$ nomad migrate init --recipe=analytics
+$ nomad migrate run -r=analytics --dry-run
+$ nomad migrate add create_events -r=analytics
+$ nomad migrate run -r=reporting --database=reporting_test
+```
+
+Priority is **recipe < environment < explicit CLI flags**. `NOMAD_CLICKHOUSE_URL`
+is the only environment variable for command options; it overrides the recipe URL.
+`.env` files are not loaded. Legacy `CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`, and
+other environment-based command options are ignored. Boolean flags accept an explicit
+`=false`, such as `--replicated=false` or `--dry-run=false`, to override an inherited
+`true`.
+
+Recipes support `url`, `database`, `source`, `replicated`, `cluster`, `ask`, `force`,
+`yes`, `target_version`, and `dry_run`. `target-version` and `dry-run` are accepted
+aliases. The optional `name` is a label; the map key selects the recipe. Only options
+supported by the selected command are used, allowing one recipe to be shared across
+commands. Relative source paths resolve from the current directory. `--ask` forces
+a URL prompt, while an explicit `--url` overrides an inherited `ask` setting.
+
+Recipe values use the same parsers as CLI flags. Recipes do not create migration
+manifests automatically: run `migrate init` explicitly before applying migrations.
 
 ## Database provisioning
 

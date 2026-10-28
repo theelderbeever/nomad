@@ -64,7 +64,7 @@ impl TestEnv {
             .arg(&self.server_url)
             .arg("--database")
             .arg(&self.db)
-            .env_remove("CLICKHOUSE_URL")
+            .env_remove("NOMAD_CLICKHOUSE_URL")
             .env_remove("DATABASE_URL")
             .env_remove("CLICKHOUSE_DATABASE")
             .env_remove("RUST_LOG")
@@ -87,7 +87,7 @@ impl TestEnv {
             .arg(&self.server_url)
             .arg("--database")
             .arg(&self.db)
-            .env_remove("CLICKHOUSE_URL")
+            .env_remove("NOMAD_CLICKHOUSE_URL")
             .env_remove("DATABASE_URL")
             .env_remove("CLICKHOUSE_DATABASE")
             .env("RUST_LOG", log)
@@ -685,7 +685,7 @@ fn isolated_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nomad"));
     command
         .current_dir(std::env::temp_dir())
-        .env_remove("CLICKHOUSE_URL")
+        .env_remove("NOMAD_CLICKHOUSE_URL")
         .env_remove("CLICKHOUSE_DATABASE")
         .env_remove("DATABASE_URL")
         .env_remove("RUST_LOG");
@@ -739,11 +739,11 @@ fn missing_connection_values_prompt_for_every_connection_command() {
 }
 
 #[test]
-fn database_flags_override_environment_and_url_paths_are_rejected() {
+fn url_flags_override_environment_and_url_paths_are_rejected() {
     for flag in ["--database", "--db"] {
         let output = isolated_command()
             .env("CLICKHOUSE_DATABASE", "")
-            .env("CLICKHOUSE_URL", "invalid")
+            .env("NOMAD_CLICKHOUSE_URL", "invalid")
             .args([
                 "migrate",
                 "run",
@@ -761,7 +761,7 @@ fn database_flags_override_environment_and_url_paths_are_rejected() {
     }
     let output = isolated_command()
         .env("CLICKHOUSE_DATABASE", "from_env")
-        .env("CLICKHOUSE_URL", "http://localhost/mydb")
+        .env("NOMAD_CLICKHOUSE_URL", "http://localhost/mydb")
         .args(["database", "create"])
         .output()
         .unwrap();

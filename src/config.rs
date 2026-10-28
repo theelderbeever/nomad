@@ -97,18 +97,6 @@ impl ConnectOptions {
     }
 }
 
-/// Resolve the server URL: --url flag > CLICKHOUSE_URL.
-pub fn resolve_url(flag: Option<ServerUrl>) -> Result<Option<ServerUrl>> {
-    resolve_url_from(flag, std::env::var("CLICKHOUSE_URL").ok())
-}
-
-fn resolve_url_from(flag: Option<ServerUrl>, env: Option<String>) -> Result<Option<ServerUrl>> {
-    if let Some(url) = flag {
-        return Ok(Some(url));
-    }
-    env.map(|raw| raw.parse()).transpose()
-}
-
 impl std::str::FromStr for ServerUrl {
     type Err = anyhow::Error;
 
@@ -132,11 +120,11 @@ impl std::str::FromStr for ServerUrl {
         let path = path.split(['?', '#']).next().unwrap_or("");
         ensure!(
             (path.is_empty() || path == "/") && (url.path().is_empty() || url.path() == "/"),
-            "server URL must not contain a path; select the database with --database/--db or CLICKHOUSE_DATABASE"
+            "server URL must not contain a path; select the database with --database/--db"
         );
         ensure!(
             url.query().is_none(),
-            "server URL must not contain query parameters; select the database with --database/--db or CLICKHOUSE_DATABASE"
+            "server URL must not contain query parameters; select the database with --database/--db"
         );
         ensure!(
             url.fragment().is_none(),
@@ -186,22 +174,6 @@ fn percent_decode(s: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn url_precedence_and_missing_url() {
-        let flag = "http://flag";
-        let env = "http://env";
-        assert_eq!(
-            resolve_url_from(Some(flag.parse().unwrap()), Some(env.into())).unwrap(),
-            Some(flag.parse().unwrap())
-        );
-        assert_eq!(
-            resolve_url_from(None, Some(env.into())).unwrap(),
-            Some(env.parse().unwrap())
-        );
-        assert_eq!(resolve_url_from(None, None).unwrap(), None);
-        assert!(resolve_url_from(None, Some("invalid".into())).is_err());
-    }
 
     #[test]
     fn parses_base_urls() {

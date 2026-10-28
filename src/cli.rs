@@ -17,6 +17,9 @@ pub struct Cli {
     /// Increase Nomad verbosity: -v = debug, -vv/-vvv = trace (dependencies unchanged)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
+    /// Load command defaults from a named recipe in .nomad-recipes.toml/.yaml/.yml
+    #[arg(short = 'r', long, global = true)]
+    pub recipe: Option<crate::recipe::RecipeName>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -40,21 +43,21 @@ pub struct SourceArg {
 
 #[derive(Args)]
 pub struct ConnectionArgs {
-    /// ClickHouse server URL (or CLICKHOUSE_URL); prompts with masked input if missing
+    /// ClickHouse server URL (or NOMAD_CLICKHOUSE_URL); prompts with masked input if missing
     #[arg(long)]
     pub url: Option<ServerUrl>,
-    /// Database name (or CLICKHOUSE_DATABASE); prompts in plain text if missing
-    #[arg(long, visible_alias = "db", env = "CLICKHOUSE_DATABASE")]
+    /// Database name; prompts in plain text if missing
+    #[arg(long, visible_alias = "db")]
     pub database: Option<DatabaseName>,
-    /// Prompt for the server URL with masked input (ignores CLICKHOUSE_URL)
-    #[arg(long, conflicts_with = "url")]
+    /// Prompt for the server URL with masked input (ignores NOMAD_CLICKHOUSE_URL)
+    #[arg(long, conflicts_with = "url", action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
     pub ask: bool,
 }
 
 #[derive(Args)]
 pub struct ManifestArgs {
     /// Use ReplicatedMergeTree for the migration manifest table
-    #[arg(long)]
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
     pub replicated: bool,
     /// Create the migration manifest table ON CLUSTER with this cluster name
     #[arg(long)]
@@ -73,7 +76,7 @@ impl ManifestArgs {
 #[derive(Args)]
 pub struct ForceArg {
     /// Disable the 1-byte MergeTree drop-size limit (max_table_size_to_drop=0)
-    #[arg(long)]
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
     pub force: bool,
 }
 
@@ -90,7 +93,7 @@ impl ForceArg {
 #[derive(Args)]
 pub struct DatabaseCreateArgs {
     /// Use the Replicated database engine with server-configured defaults
-    #[arg(long)]
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
     pub replicated: bool,
     /// Create (and reset) the database ON CLUSTER with this cluster name
     #[arg(long)]
@@ -136,7 +139,7 @@ pub enum MigrateCmd {
         #[arg(long)]
         target_version: Option<i64>,
         /// Preview migration actions without executing them (SQL logged at debug)
-        #[arg(long)]
+        #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
         dry_run: bool,
     },
     /// Revert applied migrations (default: only the latest)
@@ -151,7 +154,7 @@ pub enum MigrateCmd {
         #[arg(long)]
         target_version: Option<i64>,
         /// Preview migration actions without executing them (SQL logged at debug)
-        #[arg(long)]
+        #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
         dry_run: bool,
     },
     /// List applied and pending migrations
@@ -182,7 +185,7 @@ pub enum DatabaseCmd {
         #[arg(long)]
         cluster: Option<ClusterName>,
         /// Skip the confirmation prompt
-        #[arg(short = 'y', long = "yes")]
+        #[arg(short = 'y', long = "yes", action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
         yes: bool,
     },
     /// Create the database and run pending migrations (requires an initialized manifest)
@@ -203,7 +206,7 @@ pub enum DatabaseCmd {
         #[command(flatten)]
         definition: DatabaseCreateArgs,
         /// Skip the confirmation prompt
-        #[arg(short = 'y', long = "yes")]
+        #[arg(short = 'y', long = "yes", action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
         yes: bool,
     },
 }
