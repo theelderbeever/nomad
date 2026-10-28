@@ -6,6 +6,10 @@ fn nomad(directory: &std::path::Path) -> Command {
     command.current_dir(directory);
     for key in [
         "NOMAD_CLICKHOUSE_URL",
+        "NOMAD_CLICKHOUSE_HOST",
+        "NOMAD_CLICKHOUSE_PORT",
+        "NOMAD_CLICKHOUSE_USER",
+        "NOMAD_CLICKHOUSE_PASSWORD",
         "CLICKHOUSE_URL",
         "CLICKHOUSE_DATABASE",
         "NOMAD_SOURCE",
@@ -163,10 +167,115 @@ fn only_nomad_clickhouse_url_overlays_recipe_and_cli_can_override_it() {
     );
     assert_prompt(
         nomad(directory.path())
-            .args(["database", "create", "-r=app", "--ask"])
+            .args(["database", "create", "-r=app", "--prompt"])
             .env("NOMAD_CLICKHOUSE_URL", "invalid")
             .output()
             .unwrap(),
         "could not read server URL from masked prompt",
+    );
+}
+
+#[test]
+fn component_environment_and_cli_overrides_reach_the_client() {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join(".nomad-recipes.toml"), "[app]\nurl = 'http://url-user:url-pass@url.invalid:1'\nhost = 'recipe.invalid'\nport = 1\nuser = 'recipe-user'\npassword = 'recipe-pass'\ndatabase = 'app'").unwrap();
+    for explicit in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("no connection to test server: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\nstub").unwrap();
+            headers.to_ascii_lowercase()
+        });
+        let mut command = nomad(directory.path());
+        command
+            .args([
+                "database",
+                "create",
+                "-r=app",
+                "--url=http://url-user:url-pass@url.invalid:1",
+            ])
+            .env("NOMAD_CLICKHOUSE_HOST", "127.0.0.1")
+            .env("NOMAD_CLICKHOUSE_PORT", port.to_string())
+            .env("NOMAD_CLICKHOUSE_USER", "env-user")
+            .env("NOMAD_CLICKHOUSE_PASSWORD", "env-pass");
+        if explicit {
+            command.args(["--user=cli-user", "--password=p@ss:/%"]);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let headers = server.join().unwrap();
+        let (user, password) = if explicit {
+            ("cli-user", "p@ss:/%")
+        } else {
+            ("env-user", "env-pass")
+        };
+        assert!(
+            headers.contains(&format!("x-clickhouse-user: {user}\r\n")),
+            "{headers}"
+        );
+        assert!(
+            headers.contains(&format!("x-clickhouse-key: {password}\r\n")),
+            "{headers}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(password));
+    }
+}
+
+#[test]
+fn prompted_components_skip_invalid_environment_values() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_prompt(
+        nomad(directory.path())
+            .args(["database", "create", "--prompt=host"])
+            .env("NOMAD_CLICKHOUSE_HOST", "invalid:host")
+            .output()
+            .unwrap(),
+        "could not read host from prompt",
+    );
+    assert_prompt(
+        nomad(directory.path())
+            .args([
+                "database",
+                "create",
+                "--url=http://localhost",
+                "--prompt=port",
+            ])
+            .env("NOMAD_CLICKHOUSE_PORT", "invalid")
+            .output()
+            .unwrap(),
+        "could not read port from prompt",
     );
 }

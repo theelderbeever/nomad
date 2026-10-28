@@ -64,6 +64,10 @@ impl TestEnv {
             .arg(&self.server_url)
             .arg("--database")
             .arg(&self.db)
+            .env_remove("NOMAD_CLICKHOUSE_HOST")
+            .env_remove("NOMAD_CLICKHOUSE_PORT")
+            .env_remove("NOMAD_CLICKHOUSE_USER")
+            .env_remove("NOMAD_CLICKHOUSE_PASSWORD")
             .env_remove("NOMAD_CLICKHOUSE_URL")
             .env_remove("DATABASE_URL")
             .env_remove("CLICKHOUSE_DATABASE")
@@ -87,6 +91,10 @@ impl TestEnv {
             .arg(&self.server_url)
             .arg("--database")
             .arg(&self.db)
+            .env_remove("NOMAD_CLICKHOUSE_HOST")
+            .env_remove("NOMAD_CLICKHOUSE_PORT")
+            .env_remove("NOMAD_CLICKHOUSE_USER")
+            .env_remove("NOMAD_CLICKHOUSE_PASSWORD")
             .env_remove("NOMAD_CLICKHOUSE_URL")
             .env_remove("DATABASE_URL")
             .env_remove("CLICKHOUSE_DATABASE")
@@ -728,6 +736,10 @@ fn isolated_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nomad"));
     command
         .current_dir(std::env::temp_dir())
+        .env_remove("NOMAD_CLICKHOUSE_HOST")
+        .env_remove("NOMAD_CLICKHOUSE_PORT")
+        .env_remove("NOMAD_CLICKHOUSE_USER")
+        .env_remove("NOMAD_CLICKHOUSE_PASSWORD")
         .env_remove("NOMAD_CLICKHOUSE_URL")
         .env_remove("CLICKHOUSE_DATABASE")
         .env_remove("DATABASE_URL")
@@ -747,7 +759,7 @@ fn missing_connection_values_prompt_for_every_connection_command() {
         ("database", "setup"),
         ("database", "reset"),
     ] {
-        for url_args in [vec!["--url", "http://localhost"], vec!["--ask"]] {
+        for url_args in [vec!["--url", "http://localhost"], vec!["--prompt"]] {
             let output = isolated_command()
                 .args([category, action])
                 .args(&url_args)
@@ -755,7 +767,7 @@ fn missing_connection_values_prompt_for_every_connection_command() {
                 .unwrap();
             let error = String::from_utf8_lossy(&output.stderr);
             assert!(!output.status.success());
-            let prompt = if url_args.first() == Some(&"--ask") {
+            let prompt = if url_args.first() == Some(&"--prompt") {
                 "could not read server URL from masked prompt"
             } else {
                 "could not read database name from prompt"

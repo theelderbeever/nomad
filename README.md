@@ -39,12 +39,19 @@ Common flags:
   further repetitions stay at `trace`); accepted before or after subcommands
 - `--source <DIR>` — migration directory; prompts in plain text if omitted, with
   Tab completion for directories and `migrations` as the suggested default.
-- `--url <URL>` — server URL; falls back to `NOMAD_CLICKHOUSE_URL`
+- `-U` / `--url <URL>` — server URL; falls back to `NOMAD_CLICKHOUSE_URL`
   and prompts with masked input if missing
-- `--database <NAME>` / `--db <NAME>` — prompts in plain text if missing from flags
+- `-d` / `--database <NAME>` / `--db <NAME>` — prompts in plain text if missing from flags
   and the selected recipe. There is no implicit `default` database.
-- `--ask` — prompt for the server URL with input masked by asterisks; ignores environment
-  URLs and conflicts with `--url`, e.g. `nomad migrate run --ask --db myapp`
+- `-H` / `--host <HOST>` — override the URL host; accepts a hostname, IPv4, or IPv6 address.
+  Without a URL, a supplied host uses HTTP and port 8123.
+- `-P` / `--port <PORT>` — override the URL port (1–65535)
+- `-u` / `--user <USER>` and `-p` / `--password <PASSWORD>` / `--pass <PASSWORD>` —
+  override credentials embedded in the URL;
+  an empty password clears an inherited password
+- `-i` / `--prompt[=<FIELDS>]` — prompt for comma-separated fields: `url`, `host`, `port`,
+  `user`, `password`, or `database`. Bare `--prompt` or `-i` means `--prompt=url`; `pass` is an alias for `password`.
+  URL and password input is masked; selected fields replace inherited or explicit values.
 - `--target-version <V>` — run up to / revert down to a version
 - `--dry-run` — preview migration actions without executing them (SQL at debug)
 - `--force` — disable the drop-size limit on `migrate revert`, `database drop`, and
@@ -57,7 +64,8 @@ Pass the database separately, e.g. `nomad migrate run --url http://localhost:812
 or export `NOMAD_CLICKHOUSE_URL` and pass `--db myapp`.
 
 `--database-url` and the `DATABASE_URL` fallback are no longer supported. CLI flags
-override `NOMAD_CLICKHOUSE_URL`; `--ask` forces the URL prompt.
+override their corresponding `NOMAD_CLICKHOUSE_*` environment variables; `--prompt`
+forces input for selected fields. `--ask` is replaced by `--prompt`.
 Connection commands prompt for any missing URL or database name. For noninteractive
 use, supply the URL through a flag, recipe, or `NOMAD_CLICKHOUSE_URL`, supply the
 database through a flag or recipe, and pass `--source` to commands
@@ -107,19 +115,36 @@ $ nomad migrate add create_events -r=analytics
 $ nomad migrate run -r=reporting --database=reporting_test
 ```
 
-Priority is **recipe < environment < explicit CLI flags**. `NOMAD_CLICKHOUSE_URL`
-is the only environment variable for command options; it overrides the recipe URL.
+Priority is **recipe < environment < explicit CLI flags < selected prompts**.
+Connection environment variables are `NOMAD_CLICKHOUSE_URL`, `NOMAD_CLICKHOUSE_HOST`,
+`NOMAD_CLICKHOUSE_PORT`, `NOMAD_CLICKHOUSE_USER`, and `NOMAD_CLICKHOUSE_PASSWORD`.
 `.env` files are not loaded. Legacy `CLICKHOUSE_URL`, `CLICKHOUSE_DATABASE`, and
-other environment-based command options are ignored. Boolean flags accept an explicit
-`=false`, such as `--force=false` or `--dry-run=false`, to override an inherited
-`true`.
+other environment-based command options are ignored.
 
-Recipes support `url`, `database`, `source`, `engine`, `cluster`, `ask`, `force`,
-`yes`, `target_version`, and `dry_run`. `target-version` and `dry-run` are accepted
-aliases. The optional `name` is a label; the map key selects the recipe. Only options
+The base URL is resolved first. Separate host, port, user, and password settings
+then override components embedded in that URL, even if the URL was supplied with
+`--url`. Credentials are passed separately to the client rather than rebuilt into
+the endpoint URL. Prompting selects individual fields: `--prompt=url` replaces the
+base URL, and any separate component settings still apply. Use
+`--prompt=user,password` to replace inherited credentials. Invalid prompted values
+and canceled prompts fail without falling back to inherited values.
+
+```console
+$ export NOMAD_CLICKHOUSE_PASSWORD=secret
+$ nomad migrate run -r=reporting --host=localhost --user=app
+$ nomad migrate run -r=reporting --prompt=user,password
+$ nomad migrate info --host=localhost --db=reporting --prompt
+```
+
+Boolean flags accept an explicit `=false`, such as `--force=false` or `--dry-run=false`,
+to override an inherited `true`. Recipes support `url`, `host`, `port`, `user`,
+`password`, `database`, `source`, `engine`, `cluster`, `prompt`, `force`, `yes`,
+`target_version`, and `dry_run`. `prompt` is a comma-separated string, such as
+`prompt = "user,password"`. Recipe `pass` is an alias for `password`;
+`target-version` and `dry-run` are accepted aliases.
+The optional `name` is a label; the map key selects the recipe. Only options
 supported by the selected command are used, allowing one recipe to be shared across
-commands. Relative source paths resolve from the current directory. `--ask` forces
-a URL prompt, while an explicit `--url` overrides an inherited `ask` setting.
+commands. Relative source paths resolve from the current directory.
 
 Recipe values use the same parsers as CLI flags. Recipes do not create migration
 manifests automatically: run `migrate init` explicitly before applying migrations.

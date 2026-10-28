@@ -55,7 +55,15 @@ struct Recipe {
     #[serde(skip_serializing_if = "Option::is_none")]
     cluster: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ask: Option<bool>,
+    prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "pass")]
+    password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     force: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,12 +118,17 @@ fn load(directory: &Path, name: &RecipeName) -> Result<Recipe> {
 }
 
 pub fn environment() -> impl Provider {
-    let url: BTreeMap<_, _> = std::env::var("NOMAD_CLICKHOUSE_URL")
-        .ok()
-        .map(|value| ("url", value))
-        .into_iter()
-        .collect();
-    Serialized::defaults(url)
+    let options: BTreeMap<_, _> = [
+        ("NOMAD_CLICKHOUSE_URL", "url"),
+        ("NOMAD_CLICKHOUSE_HOST", "host"),
+        ("NOMAD_CLICKHOUSE_PORT", "port"),
+        ("NOMAD_CLICKHOUSE_USER", "user"),
+        ("NOMAD_CLICKHOUSE_PASSWORD", "password"),
+    ]
+    .into_iter()
+    .filter_map(|(env, key)| std::env::var(env).ok().map(|value| (key, value)))
+    .collect();
+    Serialized::defaults(options)
 }
 
 pub fn resolve(
@@ -148,11 +161,17 @@ pub fn resolve(
             continue;
         }
         if arg.get_long().is_some() && !matches!(id, "recipe" | "verbose" | "help") {
-            let raw = action_matches
+            let values: Vec<_> = action_matches
                 .get_raw(id)
-                .and_then(|mut values| values.next())
-                .unwrap();
-            config = config.merge(Serialized::default(id, raw.to_string_lossy().as_ref()));
+                .unwrap()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            let raw = if id == "prompt" {
+                values.join(",")
+            } else {
+                values.into_iter().next().unwrap()
+            };
+            config = config.merge(Serialized::default(id, raw));
         }
     }
     // Only extract defaults used by this command. For example, `migrate add`
@@ -164,14 +183,20 @@ pub fn resolve(
         .filter(|id| !matches!(id.as_str(), "recipe" | "verbose" | "help"))
         .collect();
     let mut defaults: BTreeMap<String, figment::value::Value> = config.extract()?;
-    if leaf.get_arguments().any(|arg| arg.get_id() == "url")
-        && action_matches.value_source("url") == Some(clap::parser::ValueSource::CommandLine)
+    if ids.iter().any(|id| id == "prompt")
+        && let Some(figment::value::Value::String(_, fields)) = defaults.get("prompt")
     {
-        // An explicit URL overrides an inherited request to prompt.
-        defaults.remove("ask");
-    } else if defaults.get("ask").and_then(|value| value.to_bool_lossy()) == Some(true) {
-        // Forced prompting must not parse or fall back to any inherited URL.
-        defaults.remove("url");
+        let prompted: Vec<_> = fields
+            .split(',')
+            .map(|field| {
+                <crate::config::PromptField as clap::ValueEnum>::from_str(field, false)
+                    .map_err(anyhow::Error::msg)
+            })
+            .collect::<Result<_>>()?;
+        // Prompted fields bypass inherited values before their domain parsers run.
+        for field in prompted {
+            defaults.remove(field.flag());
+        }
     }
     for id in ids {
         if let Some(value) = defaults.get(&id) {
@@ -438,18 +463,19 @@ mod tests {
     }
 
     #[test]
-    fn ask_forces_prompt_even_with_recipe_url() {
+    fn prompt_url_bypasses_invalid_recipe_url() {
         let directory = fixture("toml", "[app]\nurl = 'invalid'");
         let cli = resolve_test(
             directory.path(),
-            &["nomad", "migrate", "run", "-r=app", "--ask"],
+            &["nomad", "migrate", "run", "-r=app", "--prompt"],
             &[],
         )
         .unwrap();
         let Command::Migrate(MigrateCmd::Run { url, .. }) = cli.command else {
             unreachable!()
         };
-        assert!(url.ask);
+        assert_eq!(url.prompt, [crate::config::PromptField::Url]);
+        assert!(url.url.is_none());
     }
 
     #[test]
@@ -492,7 +518,7 @@ mod tests {
     fn explicit_false_overrides_inherited_boolean_values() {
         let directory = fixture(
             "toml",
-            "[app]\nengine = 'replicated'\nask = true\nforce = true\nyes = true\ndry_run = true",
+            "[app]\nengine = 'replicated'\nforce = true\nyes = true\ndry_run = true",
         );
         let cli = resolve_test(
             directory.path(),
@@ -502,7 +528,6 @@ mod tests {
                 "reset",
                 "-r=app",
                 "--engine=atomic",
-                "--ask=false",
                 "--force=false",
                 "--yes=false",
             ],
@@ -510,16 +535,15 @@ mod tests {
         )
         .unwrap();
         let Command::Database(DatabaseCmd::Reset {
-            url,
             definition,
             force,
             yes,
+            ..
         }) = cli.command
         else {
             unreachable!()
         };
         assert_eq!(definition.engine, Some(crate::db::DatabaseEngine::Atomic));
-        assert!(!url.ask);
         assert!(!force.force);
         assert!(!yes);
         let cli = resolve_test(
@@ -535,19 +559,31 @@ mod tests {
     }
 
     #[test]
-    fn explicit_url_overrides_inherited_ask() {
-        let directory = fixture("toml", "[app]\nask = true");
+    fn prompt_list_overrides_invalid_inherited_component_values() {
+        let directory = fixture(
+            "toml",
+            "[app]\nhost = 'invalid:host'\nport = 0\nuser = 'old'\npassword = 'old'",
+        );
         let cli = resolve_test(
             directory.path(),
-            &["nomad", "migrate", "run", "-r=app", "--url=http://cli"],
-            &[],
+            &[
+                "nomad",
+                "migrate",
+                "run",
+                "-r=app",
+                "--prompt=host,port,user,password",
+            ],
+            &[("port", "invalid")],
         )
         .unwrap();
         let Command::Migrate(MigrateCmd::Run { url, .. }) = cli.command else {
             unreachable!()
         };
-        assert!(!url.ask);
-        assert!(url.url.is_some());
+        assert_eq!(url.prompt.len(), 4);
+        assert!(url.host.is_none());
+        assert!(url.port.is_none());
+        assert!(url.user.is_none());
+        assert!(url.password.is_none());
     }
 
     #[test]

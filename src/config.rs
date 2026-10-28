@@ -70,6 +70,53 @@ impl MigrationDirectory {
     }
 }
 
+/// A host without credentials, port, path, or query settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerHost(url::Host<String>);
+
+impl std::str::FromStr for ServerHost {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        ensure!(
+            !raw.is_empty() && raw.trim() == raw,
+            "host must not be empty or contain surrounding whitespace"
+        );
+        let host = if let Ok(ip) = raw.parse::<std::net::Ipv6Addr>() {
+            url::Host::Ipv6(ip)
+        } else {
+            url::Host::parse(raw)
+                .context("invalid server host (expected a hostname or IP address without a port)")?
+        };
+        Ok(Self(host))
+    }
+}
+
+/// Fields that may be explicitly requested from interactive input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PromptField {
+    Url,
+    Host,
+    Port,
+    User,
+    #[value(alias = "pass")]
+    Password,
+    Database,
+}
+
+impl PromptField {
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+            Self::Host => "host",
+            Self::Port => "port",
+            Self::User => "user",
+            Self::Password => "password",
+            Self::Database => "database",
+        }
+    }
+}
+
 /// A server URL that cannot select a database or carry query settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerUrl {
@@ -94,6 +141,38 @@ impl ConnectOptions {
             password: url.password,
             database,
         }
+    }
+}
+
+impl ServerUrl {
+    pub fn from_host(host: &ServerHost) -> Result<Self> {
+        format!("http://{}", host.0).parse()
+    }
+
+    pub fn with_overrides(
+        mut self,
+        host: Option<ServerHost>,
+        port: Option<std::num::NonZeroU16>,
+        user: Option<String>,
+        password: Option<String>,
+    ) -> Self {
+        if let Some(host) = host {
+            self.endpoint
+                .set_host(Some(&host.0.to_string()))
+                .expect("validated HTTP host");
+        }
+        if let Some(port) = port {
+            self.endpoint
+                .set_port(Some(port.get()))
+                .expect("HTTP endpoint supports ports");
+        }
+        if let Some(user) = user {
+            self.user = Some(user);
+        }
+        if let Some(password) = password {
+            self.password = Some(password);
+        }
+        self
     }
 }
 
@@ -130,7 +209,14 @@ impl std::str::FromStr for ServerUrl {
             url.fragment().is_none(),
             "server URL must not contain a fragment"
         );
-        let port = url.port().unwrap_or(default_port);
+        // The URL parser normalizes explicit :80/:443 away. Preserve those
+        // supplied ports instead of replacing them with ClickHouse defaults.
+        let explicit_port = authority
+            .split(['/', '?', '#', '\\'])
+            .next()
+            .and_then(|authority| authority.rsplit_once(':'))
+            .and_then(|(_, port)| port.parse::<u16>().ok());
+        let port = url.port().or(explicit_port).unwrap_or(default_port);
         let user = match url.username() {
             "" => None,
             u => Some(percent_decode(u)?),
@@ -187,12 +273,35 @@ mod tests {
                 "https://ch.example.com:9443/",
             ),
             ("http://localhost:9999", "http://localhost:9999/"),
+            ("http://localhost:80", "http://localhost/"),
+            ("https://localhost:443", "https://localhost/"),
             ("http://[::1]:8123/", "http://[::1]:8123/"),
         ] {
             assert_eq!(
                 raw.parse::<ServerUrl>().unwrap().endpoint.as_str(),
                 endpoint
             );
+        }
+    }
+
+    #[test]
+    fn hosts_accept_names_and_addresses_but_not_other_url_components() {
+        for raw in ["localhost", "example.com", "127.0.0.1", "[::1]", "::1"] {
+            assert!(raw.parse::<ServerHost>().is_ok(), "{raw}");
+        }
+        for raw in [
+            "",
+            " ",
+            "host ",
+            "http://host",
+            "host:8123",
+            "user@host",
+            "host/path",
+            "host?setting=1",
+            "host#fragment",
+            "host\0name",
+        ] {
+            assert!(raw.parse::<ServerHost>().is_err(), "{raw}");
         }
     }
 

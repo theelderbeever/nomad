@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::{
     client::DropPolicy,
-    config::{ClusterName, DatabaseName, MigrationDirectory, ServerUrl},
+    config::{ClusterName, DatabaseName, MigrationDirectory, PromptField, ServerHost, ServerUrl},
     db::{DatabaseDefinition, DatabaseEngine},
 };
 
@@ -40,17 +40,29 @@ pub struct SourceArg {
     pub source: Option<MigrationDirectory>,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 pub struct ConnectionArgs {
     /// ClickHouse server URL (or NOMAD_CLICKHOUSE_URL); prompts with masked input if missing
-    #[arg(long)]
+    #[arg(short = 'U', long)]
     pub url: Option<ServerUrl>,
     /// Database name; prompts in plain text if missing
-    #[arg(long, visible_alias = "db")]
+    #[arg(short = 'd', long, visible_alias = "db")]
     pub database: Option<DatabaseName>,
-    /// Prompt for the server URL with masked input (ignores NOMAD_CLICKHOUSE_URL)
-    #[arg(long, conflicts_with = "url", action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true", default_value = "false")]
-    pub ask: bool,
+    /// Override the URL host (or NOMAD_CLICKHOUSE_HOST); defaults to HTTP when no URL is supplied
+    #[arg(short = 'H', long)]
+    pub host: Option<ServerHost>,
+    /// Override the URL port (or NOMAD_CLICKHOUSE_PORT), from 1 to 65535
+    #[arg(short = 'P', long)]
+    pub port: Option<std::num::NonZeroU16>,
+    /// Override the URL user (or NOMAD_CLICKHOUSE_USER)
+    #[arg(short = 'u', long)]
+    pub user: Option<String>,
+    /// Override the URL password (or NOMAD_CLICKHOUSE_PASSWORD); an empty value clears it
+    #[arg(short = 'p', long, visible_alias = "pass")]
+    pub password: Option<String>,
+    /// Prompt for comma-separated fields; bare --prompt selects url (URL/password input is masked)
+    #[arg(short = 'i', long, value_enum, value_delimiter = ',', num_args = 0..=1, require_equals = true, default_missing_value = "url")]
+    pub prompt: Vec<PromptField>,
 }
 
 #[derive(Args)]
@@ -213,8 +225,46 @@ mod tests {
     }
 
     #[test]
-    fn ask_is_available_for_connection_commands_and_conflicts_with_url() {
-        for (category, command) in [
+    fn connection_short_flags_and_password_alias_preserve_values() {
+        for password_flag in ["--password", "--pass", "-p"] {
+            let cli = parse([
+                "nomad",
+                "migrate",
+                "run",
+                "-U",
+                "https://localhost",
+                "-H",
+                "other-host",
+                "-P",
+                "9443",
+                "-u",
+                "app-user",
+                password_flag,
+                "secret",
+                "-i=user,pass",
+            ])
+            .unwrap();
+            let Command::Migrate(MigrateCmd::Run { url, .. }) = cli.command else {
+                unreachable!()
+            };
+            assert_eq!(url.url.unwrap(), "https://localhost".parse().unwrap());
+            assert_eq!(url.host.unwrap(), "other-host".parse().unwrap());
+            assert_eq!(url.port.unwrap().get(), 9443);
+            assert_eq!(url.user.as_deref(), Some("app-user"));
+            assert_eq!(url.password.as_deref(), Some("secret"));
+            assert_eq!(url.prompt, [PromptField::User, PromptField::Password]);
+        }
+        let cli = Cli::try_parse_from(["nomad", "db", "create", "-d", "short-name", "-i"]).unwrap();
+        let Command::Database(DatabaseCmd::Create { url, .. }) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(url.database.unwrap().as_str(), "short-name");
+        assert_eq!(url.prompt, [PromptField::Url]);
+    }
+
+    #[test]
+    fn prompt_accepts_fields_and_defaults_to_url_on_all_connection_commands() {
+        for (category, action) in [
             ("migrate", "init"),
             ("migrate", "run"),
             ("migrate", "revert"),
@@ -224,23 +274,46 @@ mod tests {
             ("database", "setup"),
             ("database", "reset"),
         ] {
-            assert!(parse(["nomad", category, command, "--ask"]).is_ok());
-            let error = parse([
-                "nomad",
-                category,
-                command,
+            for flags in [
+                vec!["--prompt"],
+                vec!["--prompt=user,password"],
+                vec!["-i=user,pass"],
+                vec![
+                    "-U=http://localhost",
+                    "-H=localhost",
+                    "-P=8123",
+                    "-u=app",
+                    "-p=",
+                ],
+                vec!["--url=http://localhost", "--prompt=url"],
+                vec![
+                    "--host=localhost",
+                    "--port=8443",
+                    "--user=app",
+                    "--password=",
+                ],
+            ] {
+                let mut args = vec!["nomad", category, action];
+                args.extend(flags);
+                assert!(parse(args).is_ok());
+            }
+            for flag in [
+                "--prompt=unknown",
+                "--prompt=",
+                "--port=0",
+                "--port=65536",
+                "--host=http://localhost",
                 "--ask",
-                "--url",
-                "http://localhost",
-            ])
-            .err()
-            .unwrap();
-            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+            ] {
+                assert!(parse(["nomad", category, action, flag]).is_err());
+            }
         }
-        let error = parse(["nomad", "migrate", "add", "events", "--ask"])
-            .err()
-            .unwrap();
-        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        let cli = parse(["nomad", "migrate", "run", "--prompt"]).unwrap();
+        let Command::Migrate(MigrateCmd::Run { url, .. }) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(url.prompt, [PromptField::Url]);
+        assert!(parse(["nomad", "migrate", "add", "events", "--prompt"]).is_err());
     }
 
     #[test]
