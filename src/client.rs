@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clickhouse::Client;
+use clickhouse::{Client, Compression};
 
 use crate::config::ConnectOptions;
 
@@ -44,7 +44,11 @@ pub fn connect_without_db(opts: &ConnectOptions) -> Client {
 }
 
 fn base_client(opts: &ConnectOptions) -> Client {
-    let mut client = Client::default().with_url(opts.endpoint.as_str());
+    let mut client = Client::default()
+        .with_url(opts.endpoint.as_str())
+        .with_compression(Compression::Lz4)
+        // Match the server's response codec to the client, regardless of server defaults.
+        .with_setting("network_compression_method", "lz4");
     if let Some(user) = &opts.user {
         client = client.with_user(user);
     }
